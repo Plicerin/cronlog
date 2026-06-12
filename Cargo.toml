@@ -1,0 +1,22 @@
+[package]
+name = "cron2"
+version = "0.1.0"
+edition = "2021"
+authors = ["Cron2 MVP"]
+description = "Cron2: a tiny durable scheduler with logs and run history"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+thiserror = "1.0"
+wait-timeout = "0.2"
+humantime = "2.1"
+shell-words = "1.1"
+comfy-table = "7.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
