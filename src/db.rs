@@ -1,9 +1,10 @@
 use crate::error::{Cron2Error, Result};
 use chrono::NaiveDateTime;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use std::path::Path;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Job {
     pub id: i64,
     pub name: String,
@@ -13,7 +14,7 @@ pub struct Job {
     pub next_run_at: Option<NaiveDateTime>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct JobListRow {
     pub name: String,
     pub command: String,
@@ -22,7 +23,7 @@ pub struct JobListRow {
     pub next_run_at: Option<NaiveDateTime>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct HistoryRow {
     pub run_id: i64,
     pub status: String,
@@ -41,12 +42,30 @@ pub struct InterruptedRun {
     pub job_name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct LogRow {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusRow {
+    pub name: String,
+    pub enabled: bool,
+    pub schedule: String,
+    pub next_run_at: Option<NaiveDateTime>,
+    pub running_runs: i64,
+    pub last_run_id: Option<i64>,
+    pub last_status: Option<String>,
+    pub last_trigger_type: Option<String>,
+    pub last_scheduled_for: Option<NaiveDateTime>,
+    pub last_started_at: Option<NaiveDateTime>,
+    pub last_finished_at: Option<NaiveDateTime>,
+    pub last_duration_ms: Option<i64>,
+    pub last_exit_code: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 pub struct Database {
@@ -148,6 +167,70 @@ impl Database {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn status(&self, name: Option<&str>) -> Result<Vec<StatusRow>> {
+        let conn = self.conn()?;
+        let (sql, bind_name) = if name.is_some() {
+            (
+                "SELECT j.name, j.enabled, j.schedule, j.next_run_at,
+                        (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.status = 'running') AS running_runs,
+                        r.id, r.status, r.trigger_type, r.scheduled_for, r.started_at, r.finished_at, r.duration_ms, r.exit_code, r.error
+                 FROM jobs j
+                 LEFT JOIN runs r ON r.id = (SELECT MAX(id) FROM runs WHERE job_id = j.id)
+                 WHERE j.deleted_at IS NULL AND j.name = ?1
+                 ORDER BY j.name",
+                true,
+            )
+        } else {
+            (
+                "SELECT j.name, j.enabled, j.schedule, j.next_run_at,
+                        (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.status = 'running') AS running_runs,
+                        r.id, r.status, r.trigger_type, r.scheduled_for, r.started_at, r.finished_at, r.duration_ms, r.exit_code, r.error
+                 FROM jobs j
+                 LEFT JOIN runs r ON r.id = (SELECT MAX(id) FROM runs WHERE job_id = j.id)
+                 WHERE j.deleted_at IS NULL
+                 ORDER BY j.name",
+                false,
+            )
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+        let mapper = |row: &rusqlite::Row<'_>| {
+            Ok(StatusRow {
+                name: row.get(0)?,
+                enabled: row.get::<_, i64>(1)? == 1,
+                schedule: row.get(2)?,
+                next_run_at: parse_dt_opt(row.get::<_, Option<String>>(3)?),
+                running_runs: row.get(4)?,
+                last_run_id: row.get(5)?,
+                last_status: row.get(6)?,
+                last_trigger_type: row.get(7)?,
+                last_scheduled_for: parse_dt_opt(row.get::<_, Option<String>>(8)?),
+                last_started_at: parse_dt_opt(row.get::<_, Option<String>>(9)?),
+                last_finished_at: parse_dt_opt(row.get::<_, Option<String>>(10)?),
+                last_duration_ms: row.get(11)?,
+                last_exit_code: row.get(12)?,
+                last_error: row.get(13)?,
+            })
+        };
+
+        let rows = if bind_name {
+            stmt.query_map(params![name], mapper)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], mapper)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        if name.is_some() && rows.is_empty() {
+            return Err(Cron2Error::NotFound(format!(
+                "job '{}'",
+                name.unwrap_or_default()
+            )));
+        }
+
+        Ok(rows)
     }
 
     pub fn get_due_jobs(&self, now: NaiveDateTime) -> Result<Vec<Job>> {
@@ -509,6 +592,39 @@ mod tests {
             logs.stderr.as_deref(),
             Some("daemon restarted while run was active")
         );
+
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn status_includes_latest_run_and_running_count() {
+        let db = test_db();
+        let when = fixed_time();
+        db.add_job(
+            "heartbeat",
+            &["echo".into(), "alive".into()],
+            "every 10 seconds",
+            3600,
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("heartbeat").expect("get job");
+        db.create_run(job.id, "running", when, Some(when), "manual")
+            .expect("create running run");
+        let latest = db
+            .create_run(job.id, "success", when, Some(when), "schedule")
+            .expect("create latest run");
+        db.finish_run(latest, "success", when, 123, Some(0), None)
+            .expect("finish latest run");
+
+        let status = db.status(Some("heartbeat")).expect("status");
+
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].name, "heartbeat");
+        assert_eq!(status[0].running_runs, 1);
+        assert_eq!(status[0].last_run_id, Some(latest));
+        assert_eq!(status[0].last_status.as_deref(), Some("success"));
+        assert_eq!(status[0].last_exit_code, Some(0));
 
         let _ = fs::remove_file(db.path);
     }

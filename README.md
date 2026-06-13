@@ -21,6 +21,7 @@ Pipeline recovery still belongs in the pipeline. If a video workflow needs check
 ```bash
 cargo run -- add --name heartbeat --schedule "every 10 seconds" -- echo alive
 cargo run -- list
+cargo run -- status
 cargo run -- daemon
 cargo run -- history heartbeat
 cargo run -- logs heartbeat --last
@@ -28,6 +29,15 @@ cargo run -- run heartbeat --now
 cargo run -- disable heartbeat
 cargo run -- enable heartbeat
 cargo run -- remove heartbeat
+```
+
+Inspection commands also support `--json` for scripts:
+
+```bash
+cron2 --json list
+cron2 --json status heartbeat
+cron2 --json history heartbeat --limit 5
+cron2 --json logs heartbeat --last
 ```
 
 ## Supported schedules

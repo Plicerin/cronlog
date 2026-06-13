@@ -12,6 +12,10 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "cron2.db")]
     pub db: String,
 
+    /// Emit machine-readable JSON for inspection commands
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -39,6 +43,12 @@ pub enum Commands {
 
     /// List registered jobs
     List,
+
+    /// Show scheduler status for all jobs or one job
+    Status {
+        /// Optional job name
+        name: Option<String>,
+    },
 
     /// Run the scheduler loop in the foreground
     Daemon {

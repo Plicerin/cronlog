@@ -15,6 +15,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let db = Database::open(&cli.db)?;
     db.init()?;
+    let json = cli.json;
 
     match cli.command {
         Commands::Add {
@@ -36,7 +37,19 @@ fn main() -> Result<()> {
         }
         Commands::List => {
             let jobs = db.list_jobs()?;
-            ui::print_jobs(&jobs);
+            if json {
+                ui::print_json(&jobs)?;
+            } else {
+                ui::print_jobs(&jobs);
+            }
+        }
+        Commands::Status { name } => {
+            let rows = db.status(name.as_deref())?;
+            if json {
+                ui::print_json(&rows)?;
+            } else {
+                ui::print_status(&rows);
+            }
         }
         Commands::Daemon { poll_seconds } => {
             println!("cron2 daemon started. polling every {poll_seconds}s. press Ctrl+C to stop.");
@@ -44,7 +57,11 @@ fn main() -> Result<()> {
         }
         Commands::History { name, limit } => {
             let rows = db.history(&name, limit)?;
-            ui::print_history(&rows);
+            if json {
+                ui::print_json(&rows)?;
+            } else {
+                ui::print_history(&rows);
+            }
         }
         Commands::Logs { name, last, run_id } => {
             let rid = match (last, run_id) {
@@ -54,7 +71,14 @@ fn main() -> Result<()> {
                 })?,
             };
             let logs = db.logs_for_run(rid)?;
-            ui::print_logs(rid, &logs);
+            if json {
+                ui::print_json(&serde_json::json!({
+                    "run_id": rid,
+                    "logs": logs,
+                }))?;
+            } else {
+                ui::print_logs(rid, &logs);
+            }
         }
         Commands::Run { name, now: _ } => {
             let job = db.get_job_by_name(&name)?;
