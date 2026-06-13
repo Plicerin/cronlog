@@ -36,6 +36,12 @@ pub struct HistoryRow {
 }
 
 #[derive(Debug)]
+pub struct InterruptedRun {
+    pub run_id: i64,
+    pub job_name: String,
+}
+
+#[derive(Debug)]
 pub struct LogRow {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
@@ -207,6 +213,52 @@ impl Database {
             params![status, finished_at.to_string(), duration_ms, exit_code, error, run_id],
         )?;
         Ok(())
+    }
+
+    pub fn interrupt_stale_running_runs(
+        &self,
+        finished_at: NaiveDateTime,
+        message: &str,
+    ) -> Result<Vec<InterruptedRun>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let stale_runs = {
+            let mut stmt = tx.prepare(
+                "SELECT r.id, j.name, r.started_at
+                 FROM runs r JOIN jobs j ON j.id = r.job_id
+                 WHERE r.status = 'running'
+                 ORDER BY r.id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let started_at = parse_dt_opt(row.get::<_, Option<String>>(2)?);
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, started_at))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut interrupted = Vec::with_capacity(stale_runs.len());
+        for (run_id, job_name, started_at) in stale_runs {
+            let duration_ms = started_at
+                .map(|started| {
+                    finished_at
+                        .signed_duration_since(started)
+                        .num_milliseconds()
+                })
+                .unwrap_or(0)
+                .max(0);
+            tx.execute(
+                "UPDATE runs SET status = 'interrupted', finished_at = ?1, duration_ms = ?2, error = ?3 WHERE id = ?4",
+                params![finished_at.to_string(), duration_ms, message, run_id],
+            )?;
+            tx.execute(
+                "INSERT INTO logs (run_id, stdout, stderr, stdout_truncated, stderr_truncated) VALUES (?1, '', ?2, 0, 0)",
+                params![run_id, message],
+            )?;
+            interrupted.push(InterruptedRun { run_id, job_name });
+        }
+
+        tx.commit()?;
+        Ok(interrupted)
     }
 
     pub fn insert_logs(
@@ -414,6 +466,49 @@ mod tests {
             .expect_err("unknown run should error");
 
         assert!(matches!(err, Cron2Error::NotFound(message) if message == "run 999999"));
+
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn interrupt_stale_running_runs_marks_running_runs_and_writes_logs() {
+        let db = test_db();
+        let when = fixed_time();
+        let finished_at = when + chrono::Duration::seconds(5);
+        db.add_job(
+            "heartbeat",
+            &["echo".into(), "alive".into()],
+            "every 10 seconds",
+            3600,
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("heartbeat").expect("get job");
+        let run_id = db
+            .create_run(job.id, "running", when, Some(when), "schedule")
+            .expect("create running run");
+
+        let interrupted = db
+            .interrupt_stale_running_runs(finished_at, "daemon restarted while run was active")
+            .expect("interrupt stale runs");
+
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].run_id, run_id);
+        assert_eq!(interrupted[0].job_name, "heartbeat");
+
+        let history = db.history("heartbeat", 1).expect("history");
+        assert_eq!(history[0].status, "interrupted");
+        assert_eq!(history[0].duration_ms, Some(5000));
+        assert_eq!(
+            history[0].error.as_deref(),
+            Some("daemon restarted while run was active")
+        );
+
+        let logs = db.logs_for_run(run_id).expect("logs");
+        assert_eq!(
+            logs.stderr.as_deref(),
+            Some("daemon restarted while run was active")
+        );
 
         let _ = fs::remove_file(db.path);
     }

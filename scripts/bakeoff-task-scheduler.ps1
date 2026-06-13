@@ -1,10 +1,13 @@
 param(
-    [ValidateSet("normal", "flaky", "hang", "fail", "large-output")]
+    [ValidateSet("content", "complex")]
+    [string]$Workload = "content",
+
+    [ValidateSet("normal", "flaky", "hang", "fail", "large-output", "cpu", "memory", "mixed")]
     [string]$Mode = "flaky",
 
     [int]$IntervalMinutes = 1,
 
-    [string]$TaskName = "Cron2BakeoffContentPipeline"
+    [string]$TaskName = ""
 )
 
 Set-StrictMode -Version Latest
@@ -12,8 +15,13 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $outDir = Join-Path $root "bakeoff-runs"
-$pipeline = Join-Path $root "examples\content_pipeline.ps1"
+$pipelineName = if ($Workload -eq "complex") { "complex_pipeline.ps1" } else { "content_pipeline.ps1" }
+$pipeline = Join-Path $root "examples\$pipelineName"
 $powershellExe = (Get-Command powershell.exe).Source
+
+if ([string]::IsNullOrWhiteSpace($TaskName)) {
+    $TaskName = "Cron2Bakeoff-$Workload-TaskScheduler"
+}
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 

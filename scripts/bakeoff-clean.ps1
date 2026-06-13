@@ -1,6 +1,7 @@
 param(
     [string]$TaskName = "Cron2BakeoffContentPipeline",
-    [string]$DaemonTaskName = "Cron2BakeoffDaemon"
+    [string]$DaemonTaskName = "Cron2BakeoffDaemon",
+    [string[]]$ExtraTaskNames = @("Cron2Bakeoff-content-TaskScheduler", "Cron2Bakeoff-complex-TaskScheduler")
 )
 
 Set-StrictMode -Version Latest
@@ -13,6 +14,13 @@ $outDir = Join-Path $root "bakeoff-runs"
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     Write-Host "Removed scheduled task: $TaskName"
+}
+
+foreach ($extraTaskName in $ExtraTaskNames) {
+    if (Get-ScheduledTask -TaskName $extraTaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $extraTaskName -Confirm:$false
+        Write-Host "Removed scheduled task: $extraTaskName"
+    }
 }
 
 if (Get-ScheduledTask -TaskName $DaemonTaskName -ErrorAction SilentlyContinue) {

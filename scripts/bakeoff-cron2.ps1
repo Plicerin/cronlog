@@ -1,12 +1,15 @@
 param(
-    [ValidateSet("normal", "flaky", "hang", "fail", "large-output")]
+    [ValidateSet("content", "complex")]
+    [string]$Workload = "content",
+
+    [ValidateSet("normal", "flaky", "hang", "fail", "large-output", "cpu", "memory", "mixed")]
     [string]$Mode = "flaky",
 
     [string]$Schedule = "every 1 minutes",
 
     [int]$TimeoutSeconds = 45,
 
-    [string]$JobName = "content-pipeline-cron2-live"
+    [string]$JobName = ""
 )
 
 Set-StrictMode -Version Latest
@@ -16,8 +19,13 @@ $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root "target\debug\cron2.exe"
 $db = Join-Path $root "bakeoff-cron2.db"
 $outDir = Join-Path $root "bakeoff-runs"
-$pipeline = Join-Path $root "examples\content_pipeline.ps1"
+$pipelineName = if ($Workload -eq "complex") { "complex_pipeline.ps1" } else { "content_pipeline.ps1" }
+$pipeline = Join-Path $root "examples\$pipelineName"
 $powershellExe = (Get-Command powershell.exe).Source
+
+if ([string]::IsNullOrWhiteSpace($JobName)) {
+    $JobName = "$Workload-pipeline-cron2-live"
+}
 
 Push-Location $root
 try {
