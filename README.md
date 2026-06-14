@@ -72,6 +72,8 @@ cargo build --release
 ./target/release/cronlog --help
 ```
 
+For production installation and migration from cron, see [RUNBOOK.md](RUNBOOK.md).
+
 ## Local smoke test
 
 On Windows PowerShell:
