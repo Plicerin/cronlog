@@ -1,8 +1,8 @@
-# Cron2 MVP Scope
+﻿# Cronlog MVP Scope
 
 ## Product promise
 
-Cron2 v0.1 is cron with memory: a tiny local scheduler that records every run, captures logs, prevents overlaps, and lets users inspect what happened.
+Cronlog v0.1 is cron with memory: a tiny local scheduler that records every run, captures logs, prevents overlaps, and lets users inspect what happened.
 
 ## In scope
 

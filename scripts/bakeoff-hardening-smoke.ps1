@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$Photos = 3,
     [double]$SecondsPerPhoto = 1.0,
     [int]$Fps = 12,
@@ -11,14 +11,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "target\debug\cron2.exe"
-$db = Join-Path $root "jet-montage-hardening-bakeoff-cron2.db"
+$exe = Join-Path $root "target\debug\cronlog.exe"
+$db = Join-Path $root "jet-montage-hardening-bakeoff-cronlog.db"
 $outDir = Join-Path $root "jet-montage-hardening-bakeoff-runs"
 $jobScript = Join-Path $root "scripts\jet-fighter-montage-job.ps1"
 $powershellExe = (Get-Command powershell.exe).Source
 $jobNamePrefix = "hardening-smoke"
 $script:ScenarioIndex = 0
-$script:Cron2Jobs = @()
+$script:CronlogJobs = @()
 
 function Remove-PathIfExists {
     param([string]$Path)
@@ -42,24 +42,24 @@ function Base-Args {
     )
 }
 
-function Run-Cron2Scenario {
+function Run-CronlogScenario {
     param(
         [string]$Name,
         [string[]]$ExtraArgs = @()
     )
 
-    $scheduler = "cron2-$Name"
+    $scheduler = "Cronlog-$Name"
     $args = (Base-Args -Scheduler $scheduler) + $ExtraArgs
     $script:ScenarioIndex += 1
     $jobName = "$jobNamePrefix-$($script:ScenarioIndex)-$Name"
-    $script:Cron2Jobs += $jobName
+    $script:CronlogJobs += $jobName
 
     & $exe --db $db add --name $jobName --schedule "every 1 hour" --timeout "${TimeoutSeconds}s" "--" $powershellExe @args | Out-Host
     & $exe --db $db run $jobName --now | Out-Host
 
     $event = Last-Event -Scheduler $scheduler
     [pscustomobject]@{
-        scheduler = "cron2"
+        scheduler = "cronlog"
         job = $jobName
         scenario = $Name
         status = $event.status
@@ -150,36 +150,36 @@ try {
     $results = @()
 
     Write-Host "`n== Warm cache =="
-    $results += Run-Cron2Scenario -Name "warm-cache"
+    $results += Run-CronlogScenario -Name "warm-cache"
     $results += Run-BaselineScenario -Name "warm-cache"
 
     Write-Host "`n== Connectivity interrupted, cache available =="
-    $results += Run-Cron2Scenario -Name "warm-cache" -ExtraArgs @("-SimulateOffline")
+    $results += Run-CronlogScenario -Name "warm-cache" -ExtraArgs @("-SimulateOffline")
     $results += Run-BaselineScenario -Name "warm-cache" -ExtraArgs @("-SimulateOffline")
 
     Write-Host "`n== Connectivity interrupted, no cache =="
-    $results += Run-Cron2Scenario -Name "offline-no-cache" -ExtraArgs @("-SimulateOffline")
+    $results += Run-CronlogScenario -Name "offline-no-cache" -ExtraArgs @("-SimulateOffline")
     $results += Run-BaselineScenarioAllowFailure -Name "offline-no-cache" -ExtraArgs @("-SimulateOffline")
 
     Write-Host "`n== Missing sources, no cache =="
-    $results += Run-Cron2Scenario -Name "missing-sources" -ExtraArgs @("-SimulateMissingSources")
+    $results += Run-CronlogScenario -Name "missing-sources" -ExtraArgs @("-SimulateMissingSources")
     $results += Run-BaselineScenarioAllowFailure -Name "missing-sources" -ExtraArgs @("-SimulateMissingSources")
 
     Write-Host "`n== Crash after render =="
-    $results += Run-Cron2Scenario -Name "crash-resume" -ExtraArgs @("-SimulateCrashAt", "after-render")
+    $results += Run-CronlogScenario -Name "crash-resume" -ExtraArgs @("-SimulateCrashAt", "after-render")
     $results += Run-BaselineScenarioAllowFailure -Name "crash-resume" -ExtraArgs @("-SimulateCrashAt", "after-render")
 
     Write-Host "`n== Resume after crash =="
-    $results += Run-Cron2Scenario -Name "crash-resume"
+    $results += Run-CronlogScenario -Name "crash-resume"
     $results += Run-BaselineScenario -Name "crash-resume"
 
     Write-Host "`n== Scenario summary =="
     $results | Format-Table -AutoSize | Out-Host
 
-    Write-Host "`n== Cron2 history =="
-    foreach ($cron2Job in $script:Cron2Jobs) {
-        Write-Host "`n[$cron2Job]"
-        & $exe --db $db history $cron2Job --limit 5 | Out-Host
+    Write-Host "`n== Cronlog history =="
+    foreach ($CronlogJob in $script:CronlogJobs) {
+        Write-Host "`n[$CronlogJob]"
+        & $exe --db $db history $CronlogJob --limit 5 | Out-Host
     }
 
     Write-Host "`n== State summaries =="
@@ -191,15 +191,15 @@ try {
             if ($state.PSObject.Properties.Name -contains "failure_class") {
                 $failureClass = $state.failure_class
             }
-            $cron2RunId = $null
+            $CronlogRunId = $null
             $previousStatus = $null
-            if ($state.PSObject.Properties.Name -contains "cron2") {
-                $cron2PropertyNames = @($state.cron2.PSObject.Properties | ForEach-Object { $_.Name })
-                if ($cron2PropertyNames -contains "CRON2_RUN_ID") {
-                    $cron2RunId = $state.cron2.CRON2_RUN_ID
+            if ($state.PSObject.Properties.Name -contains "cronlog") {
+                $CronlogPropertyNames = @($state.cronlog.PSObject.Properties | ForEach-Object { $_.Name })
+                if ($CronlogPropertyNames -contains "CRONLOG_RUN_ID") {
+                    $CronlogRunId = $state.cronlog.CRONLOG_RUN_ID
                 }
-                if ($cron2PropertyNames -contains "CRON2_PREVIOUS_STATUS") {
-                    $previousStatus = $state.cron2.CRON2_PREVIOUS_STATUS
+                if ($CronlogPropertyNames -contains "CRONLOG_PREVIOUS_STATUS") {
+                    $previousStatus = $state.cronlog.CRONLOG_PREVIOUS_STATUS
                 }
             }
             [pscustomobject]@{
@@ -208,7 +208,7 @@ try {
                 current_stage = $state.current_stage
                 failure_class = $failureClass
                 recovery_mode = $state.recovery_mode
-                cron2_run_id = $cron2RunId
+                Cronlog_run_id = $CronlogRunId
                 previous_status = $previousStatus
             }
         } | Format-Table -AutoSize | Out-Host
@@ -216,8 +216,8 @@ try {
     Write-Host "`nNo Windows Scheduled Tasks were created."
 }
 finally {
-    Get-Process cron2 -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -like "*cron2_mvp*" } |
+    Get-Process Cronlog -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -like "*Cronlog_mvp*" } |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Pop-Location
 }

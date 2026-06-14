@@ -1,12 +1,12 @@
-# Cron2 MVP
+﻿# Cronlog MVP
 
-Cron2 is a tiny SQLite-backed scheduler: cron's simple idea, with durable run history, captured logs, timeouts, and overlap protection.
+Cronlog is a tiny SQLite-backed scheduler: cron's simple idea, with durable run history, captured logs, timeouts, and overlap protection.
 
 ## Scope
 
-Cron2 is intentionally not a workflow orchestrator. It does not try to replace Temporal, Airflow, Prefect, Dagster, Jenkins, or a production queue.
+Cronlog is intentionally not a workflow orchestrator. It does not try to replace Temporal, Airflow, Prefect, Dagster, Jenkins, or a production queue.
 
-The MVP thesis is narrower: cron-style local scheduling with a durable audit trail. Cron2 should make it easy to answer:
+The MVP thesis is narrower: cron-style local scheduling with a durable audit trail. Cronlog should make it easy to answer:
 
 - What ran?
 - When was it supposed to run?
@@ -14,7 +14,7 @@ The MVP thesis is narrower: cron-style local scheduling with a durable audit tra
 - Did it succeed, fail, time out, get skipped, or get interrupted?
 - What stdout/stderr did it produce?
 
-Pipeline recovery still belongs in the pipeline. If a video workflow needs checkpoints, cached artifacts, source fallback, retry policy, or publish idempotency, those should live in the workflow code. Cron2 provides scheduler-owned status and logs that the workflow can inspect.
+Pipeline recovery still belongs in the pipeline. If a video workflow needs checkpoints, cached artifacts, source fallback, retry policy, or publish idempotency, those should live in the workflow code. Cronlog provides scheduler-owned status and logs that the workflow can inspect.
 
 ## MVP commands
 
@@ -34,10 +34,10 @@ cargo run -- remove heartbeat
 Inspection commands also support `--json` for scripts:
 
 ```bash
-cron2 --json list
-cron2 --json status heartbeat
-cron2 --json history heartbeat --limit 5
-cron2 --json logs heartbeat --last
+cronlog --json list
+cronlog --json status heartbeat
+cronlog --json history heartbeat --limit 5
+cronlog --json logs heartbeat --last
 ```
 
 ## Supported schedules
@@ -50,13 +50,13 @@ cron2 --json logs heartbeat --last
 Examples:
 
 ```bash
-cron2 add --name sync --schedule "every 15 minutes" -- ./sync.sh
-cron2 add --name backup --schedule "daily at 02:00" -- ./backup.sh
+cronlog add --name sync --schedule "every 15 minutes" -- ./sync.sh
+cronlog add --name backup --schedule "daily at 02:00" -- ./backup.sh
 ```
 
 ## Defaults
 
-- Database: `./cron2.db`
+- Database: `./cronlog.db`
 - Daemon poll interval: 1 second
 - Timeout: 1 hour
 - Stdout limit: 256 KB
@@ -69,7 +69,7 @@ cron2 add --name backup --schedule "daily at 02:00" -- ./backup.sh
 
 ```bash
 cargo build --release
-./target/release/cron2 --help
+./target/release/cronlog --help
 ```
 
 ## Local smoke test
@@ -86,11 +86,11 @@ The smoke script builds, runs unit tests, creates a temporary database, adds a h
 
 The `examples/content_pipeline.ps1` script simulates a content generation and social posting pipeline without touching live accounts. It writes drafts, metadata, JSONL event logs, and dry-run post records under `bakeoff-runs`.
 
-Register the same workload under Cron2:
+Register the same workload under Cronlog:
 
 ```powershell
-.\scripts\bakeoff-cron2.ps1 -Mode flaky
-.\scripts\bakeoff-start-cron2-daemon.ps1
+.\scripts\bakeoff-cronlog.ps1 -Mode flaky
+.\scripts\bakeoff-start-cronlog-daemon.ps1
 ```
 
 Register the same workload under Windows Task Scheduler:
@@ -103,8 +103,8 @@ Inspect both sides:
 
 ```powershell
 .\scripts\bakeoff-report.ps1
-.\target\debug\cron2.exe --db .\bakeoff-cron2.db history content-pipeline-cron2
-.\target\debug\cron2.exe --db .\bakeoff-cron2.db logs content-pipeline-cron2 --last
+.\target\debug\cronlog.exe --db .\bakeoff-cronlog.db history content-pipeline-cronlog
+.\target\debug\cronlog.exe --db .\bakeoff-cronlog.db logs content-pipeline-cronlog --last
 ```
 
 Useful modes:
@@ -123,13 +123,13 @@ For a more demanding workload without creating any Windows Scheduled Tasks, use 
 
 The complex workload adds step metrics, retries, fan-out draft generation, quality gates, CPU work, memory pressure, dry-run posting for many artifacts, and overlap detection. Extra complex modes include `cpu`, `memory`, and `mixed`.
 
-To compare Cron2 against a bounded baseline loop using the copied historical video pipeline's real Wikimedia media-pack stage:
+To compare Cronlog against a bounded baseline loop using the copied historical video pipeline's real Wikimedia media-pack stage:
 
 ```powershell
 .\scripts\bakeoff-production-local.ps1 -PipelineRoot C:\Users\admin\Documents\historical-video-agent -DurationSeconds 240 -IntervalSeconds 120
 ```
 
-This runs the real `scripts\wikimedia_media_pack.py` stage into isolated `cron2` and `baseline-loop` output directories. It does not create Windows Scheduled Tasks.
+This runs the real `scripts\wikimedia_media_pack.py` stage into isolated `cronlog` and `baseline-loop` output directories. It does not create Windows Scheduled Tasks.
 
 ## Jet Fighter Montage Pipeline
 
@@ -146,14 +146,14 @@ The job wrapper also keeps a stable per-scheduler recovery state under `<out>\<s
 - stage checkpoints for source search, download, render, manifest, and pipeline completion
 - cached source metadata and downloaded media
 - failure classification for connectivity, missing source, crash, and generic pipeline errors
-- Cron2 context when run by Cron2: run id, job name, scheduled time, trigger type, and previous run status
+- Cronlog context when run by Cronlog: run id, job name, scheduled time, trigger type, and previous run status
 
 Fault-injection switches for smoke tests:
 
 ```powershell
-.\scripts\jet-fighter-montage-job.ps1 -Scheduler cron2 -OutDir .\jet-montage-hardening-smoke -SimulateOffline
-.\scripts\jet-fighter-montage-job.ps1 -Scheduler cron2 -OutDir .\jet-montage-hardening-smoke -SimulateMissingSources
-.\scripts\jet-fighter-montage-job.ps1 -Scheduler cron2 -OutDir .\jet-montage-hardening-smoke -SimulateCrashAt after-render
+.\scripts\jet-fighter-montage-job.ps1 -Scheduler cronlog -OutDir .\jet-montage-hardening-smoke -SimulateOffline
+.\scripts\jet-fighter-montage-job.ps1 -Scheduler cronlog -OutDir .\jet-montage-hardening-smoke -SimulateMissingSources
+.\scripts\jet-fighter-montage-job.ps1 -Scheduler cronlog -OutDir .\jet-montage-hardening-smoke -SimulateCrashAt after-render
 ```
 
 After an interrupted or failed run, the next run can reuse cached sources/media/render output and finish from the latest valid checkpoint instead of starting from zero.
@@ -164,7 +164,7 @@ Run a bounded three-run comparison, one montage per side immediately and then ho
 .\scripts\bakeoff-jet-montage-3h.ps1
 ```
 
-This uses Cron2 for the `cron2` side and a local cron-style baseline loop for the baseline side. It creates no Windows Scheduled Tasks.
+This uses Cronlog for the `cronlog` side and a local cron-style baseline loop for the baseline side. It creates no Windows Scheduled Tasks.
 
 Compare schedulers on launch reliability, missed runs, timeout handling, overlap behavior, failure visibility, log inspection, and how quickly you can answer what happened overnight.
 
@@ -179,5 +179,5 @@ Clean up bakeoff artifacts and any older scheduled-task bakeoff entries:
 This MVP defaults to direct process execution, not shell execution. Commands are stored as argv arrays. For shell features, call the shell explicitly:
 
 ```bash
-cron2 add --name shell-example --schedule "every 1 minute" -- sh -c "echo hello && date"
+cronlog add --name shell-example --schedule "every 1 minute" -- sh -c "echo hello && date"
 ```

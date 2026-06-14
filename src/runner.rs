@@ -1,5 +1,5 @@
-use crate::db::Job;
-use crate::error::{Cron2Error, Result};
+﻿use crate::db::Job;
+use crate::error::{CronlogError, Result};
 use chrono::Local;
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -33,7 +33,7 @@ pub struct ExecuteContext {
 
 pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
     if job.command.is_empty() {
-        return Err(Cron2Error::InvalidCommand(format!(
+        return Err(CronlogError::InvalidCommand(format!(
             "job '{}' command is empty",
             job.name
         )));
@@ -43,22 +43,22 @@ pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
     let mut command = Command::new(&job.command[0]);
     command
         .args(&job.command[1..])
-        .env("CRON2_RUN_ID", context.run_id.to_string())
-        .env("CRON2_JOB_NAME", &context.job_name)
-        .env("CRON2_SCHEDULED_FOR", &context.scheduled_for)
-        .env("CRON2_TRIGGER_TYPE", &context.trigger_type)
+        .env("CRONLOG_RUN_ID", context.run_id.to_string())
+        .env("CRONLOG_JOB_NAME", &context.job_name)
+        .env("CRONLOG_SCHEDULED_FOR", &context.scheduled_for)
+        .env("CRONLOG_TRIGGER_TYPE", &context.trigger_type)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     if let Some(previous_run_id) = context.previous_run_id {
-        command.env("CRON2_PREVIOUS_RUN_ID", previous_run_id.to_string());
+        command.env("CRONLOG_PREVIOUS_RUN_ID", previous_run_id.to_string());
     }
     if let Some(previous_status) = &context.previous_status {
-        command.env("CRON2_PREVIOUS_STATUS", previous_status);
+        command.env("CRONLOG_PREVIOUS_STATUS", previous_status);
     }
 
     let mut child = command.spawn().map_err(|e| {
-        Cron2Error::InvalidCommand(format!("failed to spawn '{}': {e}", job.command[0]))
+        CronlogError::InvalidCommand(format!("failed to spawn '{}': {e}", job.command[0]))
     })?;
 
     let timeout = Duration::from_secs(job.timeout_seconds.max(1) as u64);
@@ -101,7 +101,7 @@ pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
     }
 
     let status = wait_result.ok_or_else(|| {
-        Cron2Error::Io(std::io::Error::new(
+        CronlogError::Io(std::io::Error::new(
             std::io::ErrorKind::Other,
             "process status unavailable",
         ))

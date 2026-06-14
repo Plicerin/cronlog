@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 import argparse
 import json
 import math
@@ -18,7 +18,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
-USER_AGENT = "Cron2JetFighterMontage/1.0 (local video pipeline)"
+USER_AGENT = "CronlogJetFighterMontage/1.0 (local video pipeline)"
 
 
 DEFAULT_QUERIES = [
@@ -47,14 +47,14 @@ def load_json(path, default):
         return default
 
 
-def cron2_context():
+def Cronlog_context():
     keys = [
-        "CRON2_RUN_ID",
-        "CRON2_JOB_NAME",
-        "CRON2_SCHEDULED_FOR",
-        "CRON2_TRIGGER_TYPE",
-        "CRON2_PREVIOUS_RUN_ID",
-        "CRON2_PREVIOUS_STATUS",
+        "CRONLOG_RUN_ID",
+        "CRONLOG_JOB_NAME",
+        "CRONLOG_SCHEDULED_FOR",
+        "CRONLOG_TRIGGER_TYPE",
+        "CRONLOG_PREVIOUS_RUN_ID",
+        "CRONLOG_PREVIOUS_STATUS",
     ]
     return {key: os.environ.get(key) for key in keys if os.environ.get(key)}
 
@@ -460,7 +460,7 @@ def main():
             "events": [],
         },
     )
-    state["cron2"] = cron2_context()
+    state["cronlog"] = Cronlog_context()
     state["requested"] = {
         "photos": args.photos,
         "width": args.width,
@@ -468,10 +468,10 @@ def main():
         "fps": args.fps,
         "seconds_per_photo": args.seconds_per_photo,
     }
-    state["recovery_mode"] = state.get("cron2", {}).get("CRON2_PREVIOUS_STATUS") in {"failed", "interrupted", "timed_out"}
+    state["recovery_mode"] = state.get("cronlog", {}).get("CRONLOG_PREVIOUS_STATUS") in {"failed", "interrupted", "timed_out"}
     update_state(state_path, state, "startup", "running")
 
-    queries = ["no-such-source-cron2-hardening-test"] if args.simulate_missing_sources else (args.query or DEFAULT_QUERIES)
+    queries = ["no-such-source-cronlog-hardening-test"] if args.simulate_missing_sources else (args.query or DEFAULT_QUERIES)
     started = time.time()
     warnings = []
 
@@ -541,7 +541,7 @@ def main():
                 "state": str(state_path),
                 "state_dir": str(state_dir),
                 "recovery_mode": state.get("recovery_mode", False),
-                "cron2": state.get("cron2", {}),
+                "cronlog": state.get("cronlog", {}),
                 "completed_stages": state.get("completed_stages", {}),
             },
         }

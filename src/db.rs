@@ -1,4 +1,4 @@
-use crate::error::{Cron2Error, Result};
+﻿use crate::error::{CronlogError, Result};
 use chrono::NaiveDateTime;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -224,7 +224,7 @@ impl Database {
         };
 
         if name.is_some() && rows.is_empty() {
-            return Err(Cron2Error::NotFound(format!(
+            return Err(CronlogError::NotFound(format!(
                 "job '{}'",
                 name.unwrap_or_default()
             )));
@@ -252,7 +252,7 @@ impl Database {
             "SELECT id, name, command, schedule, enabled, timeout_seconds, next_run_at FROM jobs WHERE name = ?1 AND deleted_at IS NULL",
             params![name],
             row_to_job,
-        ).optional()?.ok_or_else(|| Cron2Error::NotFound(format!("job '{name}'")))
+        ).optional()?.ok_or_else(|| CronlogError::NotFound(format!("job '{name}'")))
     }
 
     pub fn has_running_run(&self, job_id: i64) -> Result<bool> {
@@ -376,7 +376,7 @@ impl Database {
             params![enabled as i64, name],
         )?;
         if affected == 0 {
-            return Err(Cron2Error::NotFound(format!("job '{name}'")));
+            return Err(CronlogError::NotFound(format!("job '{name}'")));
         }
         Ok(())
     }
@@ -388,7 +388,7 @@ impl Database {
             params![name],
         )?;
         if affected == 0 {
-            return Err(Cron2Error::NotFound(format!("job '{name}'")));
+            return Err(CronlogError::NotFound(format!("job '{name}'")));
         }
         Ok(())
     }
@@ -452,7 +452,7 @@ impl Database {
             .is_some();
 
         if !run_exists {
-            return Err(Cron2Error::NotFound(format!("run {run_id}")));
+            return Err(CronlogError::NotFound(format!("run {run_id}")));
         }
 
         Ok(LogRow {
@@ -498,7 +498,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("cron2-test-{unique}.db"));
+        let path = std::env::temp_dir().join(format!("Cronlog-test-{unique}.db"));
         let db = Database::open(&path).expect("open test db");
         db.init().expect("init test db");
         db
@@ -548,7 +548,7 @@ mod tests {
             .logs_for_run(999_999)
             .expect_err("unknown run should error");
 
-        assert!(matches!(err, Cron2Error::NotFound(message) if message == "run 999999"));
+        assert!(matches!(err, CronlogError::NotFound(message) if message == "run 999999"));
 
         let _ = fs::remove_file(db.path);
     }

@@ -1,9 +1,9 @@
-[package]
-name = "cron2"
+﻿[package]
+name = "cronlog"
 version = "0.1.0"
 edition = "2021"
-authors = ["Cron2 MVP"]
-description = "Cron2: a tiny durable scheduler with logs and run history"
+authors = ["Cronlog MVP"]
+description = "Cronlog: a tiny durable scheduler with logs and run history"
 license = "MIT"
 
 [dependencies]

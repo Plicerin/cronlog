@@ -1,4 +1,4 @@
-use crate::error::{Cron2Error, Result};
+﻿use crate::error::{CronlogError, Result};
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 
 #[derive(Debug, Clone)]
@@ -12,7 +12,7 @@ impl Schedule {
         match self {
             Schedule::EverySeconds(seconds) => {
                 if *seconds <= 0 {
-                    return Err(Cron2Error::InvalidSchedule(
+                    return Err(CronlogError::InvalidSchedule(
                         "interval must be positive".into(),
                     ));
                 }
@@ -24,7 +24,7 @@ impl Schedule {
                     after.date().month(),
                     after.date().day(),
                 )
-                .ok_or_else(|| Cron2Error::InvalidSchedule("invalid date".into()))?;
+                .ok_or_else(|| CronlogError::InvalidSchedule("invalid date".into()))?;
                 let candidate = today.and_time(*time);
                 if candidate > after {
                     Ok(candidate)
@@ -35,7 +35,7 @@ impl Schedule {
         }
     }
 
-    /// For missed runs, Cron2 MVP runs once then computes the next future occurrence.
+    /// For missed runs, Cronlog MVP runs once then computes the next future occurrence.
     pub fn next_future_after(&self, from: NaiveDateTime) -> Result<NaiveDateTime> {
         self.next_after(from)
     }
@@ -48,9 +48,9 @@ pub fn parse_schedule(input: &str) -> Result<Schedule> {
     if parts.len() == 3 && parts[0] == "every" {
         let n: i64 = parts[1]
             .parse()
-            .map_err(|_| Cron2Error::InvalidSchedule(format!("expected number in '{input}'")))?;
+            .map_err(|_| CronlogError::InvalidSchedule(format!("expected number in '{input}'")))?;
         if n <= 0 {
-            return Err(Cron2Error::InvalidSchedule(
+            return Err(CronlogError::InvalidSchedule(
                 "interval must be positive".into(),
             ));
         }
@@ -59,7 +59,7 @@ pub fn parse_schedule(input: &str) -> Result<Schedule> {
             "minute" | "minutes" => n * 60,
             "hour" | "hours" => n * 60 * 60,
             other => {
-                return Err(Cron2Error::InvalidSchedule(format!(
+                return Err(CronlogError::InvalidSchedule(format!(
                     "unsupported interval unit '{other}'"
                 )))
             }
@@ -69,11 +69,11 @@ pub fn parse_schedule(input: &str) -> Result<Schedule> {
 
     if parts.len() == 3 && parts[0] == "daily" && parts[1] == "at" {
         let time = NaiveTime::parse_from_str(parts[2], "%H:%M")
-            .map_err(|_| Cron2Error::InvalidSchedule(format!("expected HH:MM in '{input}'")))?;
+            .map_err(|_| CronlogError::InvalidSchedule(format!("expected HH:MM in '{input}'")))?;
         return Ok(Schedule::DailyAt(time));
     }
 
-    Err(Cron2Error::InvalidSchedule(format!(
+    Err(CronlogError::InvalidSchedule(format!(
         "'{input}'. supported: 'every N seconds/minutes/hours' or 'daily at HH:MM'"
     )))
 }

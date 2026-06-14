@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet("normal", "flaky", "hang", "fail", "large-output", "cpu", "memory", "mixed")]
     [string]$Mode = "mixed",
 
@@ -8,15 +8,15 @@ param(
     [int]$Items = 12,
     [int]$MemoryMB = 128,
     [int]$FailurePercent = 20,
-    [string]$JobName = "complex-pipeline-cron2-local"
+    [string]$JobName = "complex-pipeline-Cronlog-local"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "target\debug\cron2.exe"
-$db = Join-Path $root "bakeoff-local-cron2.db"
+$exe = Join-Path $root "target\debug\cronlog.exe"
+$db = Join-Path $root "bakeoff-local-cronlog.db"
 $outDir = Join-Path $root "bakeoff-local-runs"
 $pipeline = Join-Path $root "examples\complex_pipeline.ps1"
 $powershellExe = (Get-Command powershell.exe).Source
@@ -32,7 +32,7 @@ function Stop-BakeoffJob {
 }
 
 Push-Location $root
-$cron2Job = $null
+$CronlogJob = $null
 $baselineJob = $null
 
 try {
@@ -49,12 +49,12 @@ try {
     }
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-    & $exe --db $db add --name $JobName --schedule "every 1 minutes" --timeout "${TimeoutSeconds}s" "--" $powershellExe -NoProfile -ExecutionPolicy Bypass -File $pipeline -Scheduler cron2 -OutDir $outDir -Mode $Mode -Items $Items -MemoryMB $MemoryMB -FailurePercent $FailurePercent
+    & $exe --db $db add --name $JobName --schedule "every 1 minutes" --timeout "${TimeoutSeconds}s" "--" $powershellExe -NoProfile -ExecutionPolicy Bypass -File $pipeline -Scheduler cronlog -OutDir $outDir -Mode $Mode -Items $Items -MemoryMB $MemoryMB -FailurePercent $FailurePercent
     if ($LASTEXITCODE -ne 0) {
-        throw "failed to add Cron2 bakeoff job"
+        throw "failed to add Cronlog bakeoff job"
     }
 
-    $cron2Job = Start-Job -Name "cron2-local-bakeoff-daemon" -ScriptBlock {
+    $CronlogJob = Start-Job -Name "Cronlog-local-bakeoff-daemon" -ScriptBlock {
         param($Root, $Exe, $Db)
         Set-Location $Root
         & $Exe --db $Db daemon
@@ -82,7 +82,7 @@ try {
     $deadline = (Get-Date).AddSeconds($DurationSeconds)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 10
-        Get-Process cron2 -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*cron2_mvp*" } | ForEach-Object {
+        Get-Process Cronlog -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*Cronlog_mvp*" } | ForEach-Object {
             @{
                 event = "process_sample"
                 process = $_.ProcessName
@@ -97,9 +97,9 @@ try {
 }
 finally {
     Stop-BakeoffJob $baselineJob
-    Stop-BakeoffJob $cron2Job
-    Get-Process cron2 -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*cron2_mvp*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-BakeoffJob $CronlogJob
+    Get-Process Cronlog -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*Cronlog_mvp*" } | Stop-Process -Force -ErrorAction SilentlyContinue
     Pop-Location
 }
 
-& (Join-Path $PSScriptRoot "bakeoff-report.ps1") -OutDir $outDir -Cron2Db $db -Cron2Job $JobName -Workload complex -Schedulers cron2,baseline-loop
+& (Join-Path $PSScriptRoot "bakeoff-report.ps1") -OutDir $outDir -CronlogDb $db -CronlogJob $JobName -Workload complex -Schedulers Cronlog,baseline-loop

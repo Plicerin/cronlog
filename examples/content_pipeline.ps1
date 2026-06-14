@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$Scheduler,
 
@@ -116,11 +116,11 @@ try {
     )
     $topic = $topics[(Get-Random -Minimum 0 -Maximum $topics.Count)]
     $draft = @"
-Cron2 field note: $topic.
+Cronlog field note: $topic.
 
 When an automation fails, the most useful feature is being able to answer what ran, when it ran, and what it printed.
 
-#LocalAutomation #Schedulers #Cron2
+#LocalAutomation #Schedulers #Cronlog
 "@
 
     $payloadHash = Get-Hash -Text $draft

@@ -1,4 +1,4 @@
-use crate::db::{HistoryRow, JobListRow, LogRow, StatusRow};
+﻿use crate::db::{HistoryRow, JobListRow, LogRow, StatusRow};
 use comfy_table::{presets::UTF8_FULL, Cell, Table};
 use serde::Serialize;
 

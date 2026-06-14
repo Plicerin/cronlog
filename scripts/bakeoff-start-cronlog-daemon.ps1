@@ -1,13 +1,13 @@
-param(
-    [string]$TaskName = "Cron2BakeoffDaemon",
-    [string]$DbPath = $(Join-Path (Split-Path -Parent $PSScriptRoot) "bakeoff-cron2.db")
+﻿param(
+    [string]$TaskName = "CronlogBakeoffDaemon",
+    [string]$DbPath = $(Join-Path (Split-Path -Parent $PSScriptRoot) "bakeoff-cronlog.db")
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "target\debug\cron2.exe"
+$exe = Join-Path $root "target\debug\cronlog.exe"
 
 if (!(Test-Path $exe)) {
     cargo build
@@ -23,7 +23,7 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 
-Write-Host "Cron2 daemon task started: $TaskName"
+Write-Host "Cronlog daemon task started: $TaskName"
 Write-Host "Inspect with:"
 Write-Host "  Get-ScheduledTaskInfo -TaskName $TaskName"
 Write-Host "Stop with:"

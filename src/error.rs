@@ -1,9 +1,9 @@
-use thiserror::Error;
+﻿use thiserror::Error;
 
-pub type Result<T> = std::result::Result<T, Cron2Error>;
+pub type Result<T> = std::result::Result<T, CronlogError>;
 
 #[derive(Debug, Error)]
-pub enum Cron2Error {
+pub enum CronlogError {
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
 

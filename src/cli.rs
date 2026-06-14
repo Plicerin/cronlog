@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+﻿use clap::{Parser, Subcommand};
 use std::time::Duration;
 
 fn parse_duration(input: &str) -> std::result::Result<Duration, String> {
@@ -6,10 +6,10 @@ fn parse_duration(input: &str) -> std::result::Result<Duration, String> {
 }
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Cron2: cron with durable history and logs")]
+#[command(author, version, about = "Cronlog: cron with durable history and logs")]
 pub struct Cli {
     /// SQLite database path
-    #[arg(long, global = true, default_value = "cron2.db")]
+    #[arg(long, global = true, default_value = "cronlog.db")]
     pub db: String,
 
     /// Emit machine-readable JSON for inspection commands

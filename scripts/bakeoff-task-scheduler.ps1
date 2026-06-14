@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet("content", "complex")]
     [string]$Workload = "content",
 
@@ -20,7 +20,7 @@ $pipeline = Join-Path $root "examples\$pipelineName"
 $powershellExe = (Get-Command powershell.exe).Source
 
 if ([string]::IsNullOrWhiteSpace($TaskName)) {
-    $TaskName = "Cron2Bakeoff-$Workload-TaskScheduler"
+    $TaskName = "CronlogBakeoff-$Workload-TaskScheduler"
 }
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null

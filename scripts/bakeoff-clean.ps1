@@ -1,14 +1,14 @@
-param(
-    [string]$TaskName = "Cron2BakeoffContentPipeline",
-    [string]$DaemonTaskName = "Cron2BakeoffDaemon",
-    [string[]]$ExtraTaskNames = @("Cron2Bakeoff-content-TaskScheduler", "Cron2Bakeoff-complex-TaskScheduler")
+﻿param(
+    [string]$TaskName = "CronlogBakeoffContentPipeline",
+    [string]$DaemonTaskName = "CronlogBakeoffDaemon",
+    [string[]]$ExtraTaskNames = @("CronlogBakeoff-content-TaskScheduler", "CronlogBakeoff-complex-TaskScheduler")
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$db = Join-Path $root "bakeoff-cron2.db"
+$db = Join-Path $root "bakeoff-cronlog.db"
 $outDir = Join-Path $root "bakeoff-runs"
 
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {

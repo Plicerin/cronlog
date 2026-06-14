@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet("content", "complex")]
     [string]$Workload = "content",
 
@@ -16,15 +16,15 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "target\debug\cron2.exe"
-$db = Join-Path $root "bakeoff-cron2.db"
+$exe = Join-Path $root "target\debug\cronlog.exe"
+$db = Join-Path $root "bakeoff-cronlog.db"
 $outDir = Join-Path $root "bakeoff-runs"
 $pipelineName = if ($Workload -eq "complex") { "complex_pipeline.ps1" } else { "content_pipeline.ps1" }
 $pipeline = Join-Path $root "examples\$pipelineName"
 $powershellExe = (Get-Command powershell.exe).Source
 
 if ([string]::IsNullOrWhiteSpace($JobName)) {
-    $JobName = "$Workload-pipeline-cron2-live"
+    $JobName = "$Workload-pipeline-Cronlog-live"
 }
 
 Push-Location $root
@@ -42,21 +42,21 @@ try {
     $removeExitCode = $LASTEXITCODE
     $ErrorActionPreference = $previousErrorActionPreference
     if ($removeExitCode -ne 0 -and (($removeOutput -join "`n") -notmatch "NotFound")) {
-        throw "failed to remove previous Cron2 bakeoff job: $($removeOutput -join "`n")"
+        throw "failed to remove previous Cronlog bakeoff job: $($removeOutput -join "`n")"
     }
 
-    & $exe --db $db add --name $JobName --schedule $Schedule --timeout "${TimeoutSeconds}s" "--" $powershellExe -NoProfile -ExecutionPolicy Bypass -File $pipeline -Scheduler cron2 -OutDir $outDir -Mode $Mode
+    & $exe --db $db add --name $JobName --schedule $Schedule --timeout "${TimeoutSeconds}s" "--" $powershellExe -NoProfile -ExecutionPolicy Bypass -File $pipeline -Scheduler cronlog -OutDir $outDir -Mode $Mode
     if ($LASTEXITCODE -ne 0) {
-        throw "failed to add Cron2 bakeoff job"
+        throw "failed to add Cronlog bakeoff job"
     }
 
-    Write-Host "Cron2 bakeoff job registered."
+    Write-Host "Cronlog bakeoff job registered."
     Write-Host "Run this in a foreground terminal:"
-    Write-Host "  .\target\debug\cron2.exe --db .\bakeoff-cron2.db daemon"
+    Write-Host "  .\target\debug\cronlog.exe --db .\bakeoff-cronlog.db daemon"
     Write-Host ""
     Write-Host "Inspect with:"
-    Write-Host "  .\target\debug\cron2.exe --db .\bakeoff-cron2.db history $JobName"
-    Write-Host "  .\target\debug\cron2.exe --db .\bakeoff-cron2.db logs $JobName --last"
+    Write-Host "  .\target\debug\cronlog.exe --db .\bakeoff-cronlog.db history $JobName"
+    Write-Host "  .\target\debug\cronlog.exe --db .\bakeoff-cronlog.db logs $JobName --last"
 }
 finally {
     Pop-Location

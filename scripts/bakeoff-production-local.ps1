@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$PipelineRoot = "C:\Users\admin\Documents\historical-video-agent",
     [string]$ArticleTitle = "Statue of Liberty",
     [string]$EventText = "On June 17, 1885, the Statue of Liberty arrived in New York Harbor aboard the French ship Isere.",
@@ -6,15 +6,15 @@ param(
     [int]$IntervalSeconds = 120,
     [int]$TimeoutSeconds = 180,
     [switch]$NoDownload,
-    [string]$JobName = "historical-production-cron2-local"
+    [string]$JobName = "historical-production-Cronlog-local"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "target\debug\cron2.exe"
-$db = Join-Path $root "bakeoff-production-cron2.db"
+$exe = Join-Path $root "target\debug\cronlog.exe"
+$db = Join-Path $root "bakeoff-production-cronlog.db"
 $outDir = Join-Path $root "bakeoff-production-runs"
 $jobScript = Join-Path $root "scripts\historical-production-job.ps1"
 $powershellExe = (Get-Command powershell.exe).Source
@@ -30,7 +30,7 @@ function Stop-BakeoffJob {
 }
 
 Push-Location $root
-$cron2Job = $null
+$CronlogJob = $null
 $baselineJob = $null
 
 try {
@@ -62,12 +62,12 @@ try {
         $jobArgs += "-NoDownload"
     }
 
-    & $exe --db $db add --name $JobName --schedule "every $IntervalSeconds seconds" --timeout "${TimeoutSeconds}s" "--" $powershellExe @jobArgs -Scheduler cron2
+    & $exe --db $db add --name $JobName --schedule "every $IntervalSeconds seconds" --timeout "${TimeoutSeconds}s" "--" $powershellExe @jobArgs -Scheduler cronlog
     if ($LASTEXITCODE -ne 0) {
-        throw "failed to add Cron2 production bakeoff job"
+        throw "failed to add Cronlog production bakeoff job"
     }
 
-    $cron2Job = Start-Job -Name "cron2-production-bakeoff-daemon" -ScriptBlock {
+    $CronlogJob = Start-Job -Name "Cronlog-production-bakeoff-daemon" -ScriptBlock {
         param($Root, $Exe, $Db)
         Set-Location $Root
         & $Exe --db $Db daemon
@@ -96,7 +96,7 @@ try {
     $deadline = (Get-Date).AddSeconds($DurationSeconds)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 10
-        Get-Process cron2,python,powershell -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-Process Cronlog,python,powershell -ErrorAction SilentlyContinue | ForEach-Object {
             @{
                 event = "process_sample"
                 process = $_.ProcessName
@@ -111,9 +111,9 @@ try {
 }
 finally {
     Stop-BakeoffJob $baselineJob
-    Stop-BakeoffJob $cron2Job
-    Get-Process cron2 -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*cron2_mvp*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-BakeoffJob $CronlogJob
+    Get-Process Cronlog -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*Cronlog_mvp*" } | Stop-Process -Force -ErrorAction SilentlyContinue
     Pop-Location
 }
 
-& (Join-Path $PSScriptRoot "bakeoff-report.ps1") -OutDir $outDir -Cron2Db $db -Cron2Job $JobName -Workload production -Schedulers cron2,baseline-loop
+& (Join-Path $PSScriptRoot "bakeoff-report.ps1") -OutDir $outDir -CronlogDb $db -CronlogJob $JobName -Workload production -Schedulers Cronlog,baseline-loop

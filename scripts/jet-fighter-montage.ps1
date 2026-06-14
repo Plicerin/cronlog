@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$OutDir = $(Join-Path (Split-Path -Parent $PSScriptRoot) "jet-fighter-montage-output"),
     [int]$Photos = 8,
     [double]$SecondsPerPhoto = 3.0,

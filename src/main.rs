@@ -25,7 +25,7 @@ fn main() -> Result<()> {
             command,
         } => {
             if command.is_empty() {
-                return Err(error::Cron2Error::InvalidCommand(
+                return Err(error::CronlogError::InvalidCommand(
                     "command cannot be empty".into(),
                 ));
             }
@@ -52,7 +52,9 @@ fn main() -> Result<()> {
             }
         }
         Commands::Daemon { poll_seconds } => {
-            println!("cron2 daemon started. polling every {poll_seconds}s. press Ctrl+C to stop.");
+            println!(
+                "Cronlog daemon started. polling every {poll_seconds}s. press Ctrl+C to stop."
+            );
             scheduler::run_daemon(&db, poll_seconds)?;
         }
         Commands::History { name, limit } => {
@@ -67,7 +69,7 @@ fn main() -> Result<()> {
             let rid = match (last, run_id) {
                 (_, Some(id)) => id,
                 (true, None) | (false, None) => db.last_run_id(&name)?.ok_or_else(|| {
-                    error::Cron2Error::NotFound(format!("no runs found for job '{name}'"))
+                    error::CronlogError::NotFound(format!("no runs found for job '{name}'"))
                 })?,
             };
             let logs = db.logs_for_run(rid)?;

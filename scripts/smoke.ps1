@@ -1,14 +1,14 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "target\debug\cron2.exe"
-$db = Join-Path ([System.IO.Path]::GetTempPath()) ("cron2-smoke-{0}.db" -f ([Guid]::NewGuid()))
+$exe = Join-Path $root "target\debug\cronlog.exe"
+$db = Join-Path ([System.IO.Path]::GetTempPath()) ("cronlog-smoke-{0}.db" -f ([Guid]::NewGuid()))
 
-function Invoke-Cron2 {
+function Invoke-Cronlog {
     & $exe --db $db @args
     if ($LASTEXITCODE -ne 0) {
-        throw "cron2 exited with code $LASTEXITCODE for args: $args"
+        throw "Cronlog exited with code $LASTEXITCODE for args: $args"
     }
 }
 
@@ -25,10 +25,10 @@ try {
         throw "cargo test failed with code $LASTEXITCODE"
     }
 
-    Invoke-Cron2 add --name heartbeat --schedule "every 10 seconds" "--" powershell -NoProfile -Command "Write-Output alive"
-    Invoke-Cron2 list
-    Invoke-Cron2 run heartbeat --now
-    Invoke-Cron2 history heartbeat
+    Invoke-cronlog add --name heartbeat --schedule "every 10 seconds" "--" powershell -NoProfile -Command "Write-Output alive"
+    Invoke-Cronlog list
+    Invoke-Cronlog run heartbeat --now
+    Invoke-Cronlog history heartbeat
 
     $logs = & $exe --db $db logs heartbeat --last
     if ($LASTEXITCODE -ne 0) {
@@ -38,9 +38,9 @@ try {
         throw "expected heartbeat logs to contain 'alive'"
     }
 
-    Invoke-Cron2 disable heartbeat
-    Invoke-Cron2 enable heartbeat
-    Invoke-Cron2 remove heartbeat
+    Invoke-Cronlog disable heartbeat
+    Invoke-Cronlog enable heartbeat
+    Invoke-Cronlog remove heartbeat
 
     Write-Host "Smoke test passed."
 }

@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$Runs = 3,
     [int]$IntervalSeconds = 3600,
     [int]$TimeoutSeconds = 1800,
@@ -7,15 +7,15 @@ param(
     [int]$Fps = 30,
     [int]$Width = 1080,
     [int]$Height = 1920,
-    [string]$JobName = "jet-montage-cron2-3h"
+    [string]$JobName = "jet-montage-Cronlog-3h"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "target\debug\cron2.exe"
-$db = Join-Path $root "jet-montage-bakeoff-cron2.db"
+$exe = Join-Path $root "target\debug\cronlog.exe"
+$db = Join-Path $root "jet-montage-bakeoff-cronlog.db"
 $outDir = Join-Path $root "jet-montage-bakeoff-runs"
 $jobScript = Join-Path $root "scripts\jet-fighter-montage-job.ps1"
 $powershellExe = (Get-Command powershell.exe).Source
@@ -67,11 +67,11 @@ function Count-TerminalRuns {
 }
 
 Push-Location $root
-$cron2Job = $null
+$CronlogJob = $null
 $baselineJob = $null
-$initialCron2Job = $null
+$initialCronlogJob = $null
 $initialBaselineJob = $null
-$cron2Stopped = $false
+$CronlogStopped = $false
 
 try {
     cargo build
@@ -98,12 +98,12 @@ try {
         "-Height", $Height
     )
 
-    & $exe --db $db add --name $JobName --schedule "every $IntervalSeconds seconds" --timeout "${TimeoutSeconds}s" "--" $powershellExe @commonArgs -Scheduler cron2
+    & $exe --db $db add --name $JobName --schedule "every $IntervalSeconds seconds" --timeout "${TimeoutSeconds}s" "--" $powershellExe @commonArgs -Scheduler cronlog
     if ($LASTEXITCODE -ne 0) {
-        throw "failed to add Cron2 montage job"
+        throw "failed to add Cronlog montage job"
     }
 
-    $initialCron2Job = Start-Job -Name "cron2-jet-montage-initial" -ScriptBlock {
+    $initialCronlogJob = Start-Job -Name "Cronlog-jet-montage-initial" -ScriptBlock {
         param($Root, $Exe, $Db, $JobName)
         Set-Location $Root
         & $Exe --db $Db run $JobName --now
@@ -115,12 +115,12 @@ try {
         & $PowerShellExe @CommonArgs -Scheduler baseline-loop
     } -ArgumentList $root, $powershellExe, $commonArgs
 
-    Wait-Job $initialCron2Job | Out-Null
-    Receive-Job $initialCron2Job -ErrorAction SilentlyContinue | Out-Host
-    Remove-Job $initialCron2Job -Force -ErrorAction SilentlyContinue
-    $initialCron2Job = $null
+    Wait-Job $initialCronlogJob | Out-Null
+    Receive-Job $initialCronlogJob -ErrorAction SilentlyContinue | Out-Host
+    Remove-Job $initialCronlogJob -Force -ErrorAction SilentlyContinue
+    $initialCronlogJob = $null
 
-    $cron2Job = Start-Job -Name "cron2-jet-montage-3h-daemon" -ScriptBlock {
+    $CronlogJob = Start-Job -Name "Cronlog-jet-montage-3h-daemon" -ScriptBlock {
         param($Root, $Exe, $Db)
         Set-Location $Root
         & $Exe --db $Db daemon
@@ -158,31 +158,31 @@ try {
     $pollSeconds = [Math]::Max(1, [Math]::Min(30, [Math]::Floor($IntervalSeconds / 4)))
     while ($true) {
         Start-Sleep -Seconds $pollSeconds
-        $cron2Finished = Count-FinishedRuns -Scheduler "cron2" -OutDir $outDir
+        $CronlogFinished = Count-FinishedRuns -Scheduler "cronlog" -OutDir $outDir
         $baselineFinished = Count-FinishedRuns -Scheduler "baseline-loop" -OutDir $outDir
-        $cron2Terminal = Count-TerminalRuns -Scheduler "cron2" -OutDir $outDir
+        $CronlogTerminal = Count-TerminalRuns -Scheduler "cronlog" -OutDir $outDir
         $baselineTerminal = Count-TerminalRuns -Scheduler "baseline-loop" -OutDir $outDir
-        Write-Host "Progress: cron2=$cron2Finished/$Runs baseline=$baselineFinished/$Runs"
-        if (!$cron2Stopped -and $cron2Finished -ge $Runs) {
-            Stop-BakeoffJob $cron2Job
-            $cron2Job = $null
-            $cron2Stopped = $true
+        Write-Host "Progress: Cronlog=$CronlogFinished/$Runs baseline=$baselineFinished/$Runs"
+        if (!$CronlogStopped -and $CronlogFinished -ge $Runs) {
+            Stop-BakeoffJob $CronlogJob
+            $CronlogJob = $null
+            $CronlogStopped = $true
         }
-        if ($cron2Finished -ge $Runs -and $baselineFinished -ge $Runs) {
+        if ($CronlogFinished -ge $Runs -and $baselineFinished -ge $Runs) {
             break
         }
         if ((Get-Date) -gt $deadline) {
-            throw "timed out waiting for successful runs: cron2 finished=$cron2Finished terminal=$cron2Terminal; baseline finished=$baselineFinished terminal=$baselineTerminal"
+            throw "timed out waiting for successful runs: Cronlog finished=$CronlogFinished terminal=$CronlogTerminal; baseline finished=$baselineFinished terminal=$baselineTerminal"
         }
     }
 }
 finally {
     Stop-BakeoffJob $initialBaselineJob
-    Stop-BakeoffJob $initialCron2Job
+    Stop-BakeoffJob $initialCronlogJob
     Stop-BakeoffJob $baselineJob
-    Stop-BakeoffJob $cron2Job
-    Get-Process cron2 -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*cron2_mvp*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-BakeoffJob $CronlogJob
+    Get-Process Cronlog -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*Cronlog_mvp*" } | Stop-Process -Force -ErrorAction SilentlyContinue
     Pop-Location
 }
 
-& (Join-Path $PSScriptRoot "bakeoff-report.ps1") -OutDir $outDir -Cron2Db $db -Cron2Job $JobName -Workload jet-montage -Schedulers cron2,baseline-loop
+& (Join-Path $PSScriptRoot "bakeoff-report.ps1") -OutDir $outDir -CronlogDb $db -CronlogJob $JobName -Workload jet-montage -Schedulers Cronlog,baseline-loop

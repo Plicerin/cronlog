@@ -1,19 +1,19 @@
-param(
+﻿param(
     [string]$OutDir = $(Join-Path (Split-Path -Parent $PSScriptRoot) "bakeoff-runs"),
-    [string]$Cron2Db = $(Join-Path (Split-Path -Parent $PSScriptRoot) "bakeoff-cron2.db"),
-    [string]$Cron2Job = "complex-pipeline-cron2-live",
+    [string]$CronlogDb = $(Join-Path (Split-Path -Parent $PSScriptRoot) "bakeoff-cronlog.db"),
+    [string]$CronlogJob = "complex-pipeline-Cronlog-live",
 
     [ValidateSet("all", "content", "complex", "production", "jet-montage")]
     [string]$Workload = "all",
 
-    [string[]]$Schedulers = @("cron2", "task-scheduler")
+    [string[]]$Schedulers = @("cronlog", "task-scheduler")
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "target\debug\cron2.exe"
+$exe = Join-Path $root "target\debug\cronlog.exe"
 
 function Read-JsonLines {
     param([string]$Path)
@@ -110,8 +110,8 @@ foreach ($scheduler in $Schedulers) {
     }
 }
 
-if ((Test-Path $exe) -and (Test-Path $Cron2Db)) {
+if ((Test-Path $exe) -and (Test-Path $CronlogDb)) {
     Write-Host ""
-    Write-Host "[cron2 history]"
-    & $exe --db $Cron2Db history $Cron2Job
+    Write-Host "[Cronlog history]"
+    & $exe --db $CronlogDb history $CronlogJob
 }
