@@ -1,4 +1,4 @@
-﻿use crate::db::Job;
+use crate::db::Job;
 use crate::error::{CronlogError, Result};
 use chrono::Local;
 use std::io::Read;
@@ -73,16 +73,38 @@ pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
 
+    let mut log_read_errors = Vec::new();
     if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_end(&mut stdout_bytes);
+        if let Err(err) = stdout.read_to_end(&mut stdout_bytes) {
+            log_read_errors.push(format!("failed to read stdout: {err}"));
+        }
     }
     if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_end(&mut stderr_bytes);
+        if let Err(err) = stderr.read_to_end(&mut stderr_bytes) {
+            log_read_errors.push(format!("failed to read stderr: {err}"));
+        }
     }
 
-    let (stdout, stdout_truncated) = bytes_to_limited_string(stdout_bytes, MAX_STDOUT_BYTES);
-    let (stderr, stderr_truncated) = bytes_to_limited_string(stderr_bytes, MAX_STDERR_BYTES);
+    if !log_read_errors.is_empty() {
+        stderr_bytes.extend_from_slice(b"\n[cronlog log capture warning]\n");
+        stderr_bytes.extend_from_slice(log_read_errors.join("\n").as_bytes());
+        stderr_bytes.push(b'\n');
+    }
+
+    let (stdout, stdout_truncated) = bytes_to_limited_string(
+        stdout_bytes,
+        max_log_bytes("CRONLOG_MAX_STDOUT_BYTES", MAX_STDOUT_BYTES),
+    );
+    let (stderr, stderr_truncated) = bytes_to_limited_string(
+        stderr_bytes,
+        max_log_bytes("CRONLOG_MAX_STDERR_BYTES", MAX_STDERR_BYTES),
+    );
     let duration_ms = start.elapsed().as_millis() as i64;
+    let log_capture_error = if log_read_errors.is_empty() {
+        None
+    } else {
+        Some(log_read_errors.join("; "))
+    };
 
     if timed_out {
         return Ok(RunOutput {
@@ -93,10 +115,19 @@ pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
             stdout_truncated,
             stderr_truncated,
             duration_ms,
-            error: Some(format!(
-                "job timed out after {} seconds",
-                job.timeout_seconds
-            )),
+            error: Some(
+                [
+                    Some(format!(
+                        "job timed out after {} seconds",
+                        job.timeout_seconds
+                    )),
+                    log_capture_error,
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; "),
+            ),
         });
     }
 
@@ -121,7 +152,7 @@ pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
         stdout_truncated,
         stderr_truncated,
         duration_ms,
-        error: None,
+        error: log_capture_error,
     })
 }
 
@@ -132,9 +163,19 @@ fn bytes_to_limited_string(mut bytes: Vec<u8>, max_bytes: usize) -> (String, boo
     }
     let mut s = String::from_utf8_lossy(&bytes).to_string();
     if truncated {
-        s.push_str("\n...[truncated]");
+        s.push_str(&format!(
+            "\n...[truncated by cronlog at {max_bytes} bytes; full output was larger]"
+        ));
     }
     (s, truncated)
+}
+
+fn max_log_bytes(env_key: &str, default: usize) -> usize {
+    std::env::var(env_key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 pub fn now() -> chrono::NaiveDateTime {

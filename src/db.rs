@@ -1,6 +1,6 @@
 ﻿use crate::error::{CronlogError, Result};
 use chrono::NaiveDateTime;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::path::Path;
 
@@ -40,6 +40,13 @@ pub struct HistoryRow {
 pub struct InterruptedRun {
     pub run_id: i64,
     pub job_name: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunClaim {
+    Claimed(i64),
+    Skipped(i64),
+    NotDue,
 }
 
 #[derive(Debug, Serialize)]
@@ -255,14 +262,59 @@ impl Database {
         ).optional()?.ok_or_else(|| CronlogError::NotFound(format!("job '{name}'")))
     }
 
-    pub fn has_running_run(&self, job_id: i64) -> Result<bool> {
-        let conn = self.conn()?;
-        let count: i64 = conn.query_row(
+    pub fn claim_scheduled_run(
+        &self,
+        job_id: i64,
+        scheduled_for: NaiveDateTime,
+        next_run_at: NaiveDateTime,
+        started_at: NaiveDateTime,
+    ) -> Result<RunClaim> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let current_next = tx
+            .query_row(
+                "SELECT next_run_at FROM jobs WHERE id = ?1 AND enabled = 1 AND deleted_at IS NULL",
+                params![job_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+
+        if parse_dt_opt(current_next) != Some(scheduled_for) {
+            tx.commit()?;
+            return Ok(RunClaim::NotDue);
+        }
+
+        let running_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM runs WHERE job_id = ?1 AND status = 'running'",
             params![job_id],
             |row| row.get(0),
         )?;
-        Ok(count > 0)
+
+        let claim = if running_count > 0 {
+            tx.execute(
+                "INSERT INTO runs (job_id, status, scheduled_for, finished_at, duration_ms, trigger_type, error)
+                 VALUES (?1, 'skipped', ?2, ?3, 0, 'schedule', 'previous run still active')",
+                params![job_id, scheduled_for.to_string(), started_at.to_string()],
+            )?;
+            RunClaim::Skipped(tx.last_insert_rowid())
+        } else {
+            tx.execute(
+                "INSERT INTO runs (job_id, status, scheduled_for, started_at, trigger_type)
+                 VALUES (?1, 'running', ?2, ?3, 'schedule')",
+                params![job_id, scheduled_for.to_string(), started_at.to_string()],
+            )?;
+            RunClaim::Claimed(tx.last_insert_rowid())
+        };
+
+        tx.execute(
+            "UPDATE jobs SET next_run_at = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![next_run_at.to_string(), job_id],
+        )?;
+
+        tx.commit()?;
+        Ok(claim)
     }
 
     pub fn create_run(
@@ -356,15 +408,6 @@ impl Database {
         conn.execute(
             "INSERT INTO logs (run_id, stdout, stderr, stdout_truncated, stderr_truncated) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![run_id, stdout, stderr, stdout_truncated as i64, stderr_truncated as i64],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_next_run(&self, job_id: i64, next_run_at: NaiveDateTime) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "UPDATE jobs SET next_run_at = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-            params![next_run_at.to_string(), job_id],
         )?;
         Ok(())
     }
@@ -625,6 +668,76 @@ mod tests {
         assert_eq!(status[0].last_run_id, Some(latest));
         assert_eq!(status[0].last_status.as_deref(), Some("success"));
         assert_eq!(status[0].last_exit_code, Some(0));
+
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn claim_scheduled_run_claims_once_and_updates_next_run() {
+        let db = test_db();
+        let when = fixed_time();
+        let next = when + chrono::Duration::seconds(10);
+        db.add_job(
+            "heartbeat",
+            &["echo".into(), "alive".into()],
+            "every 10 seconds",
+            3600,
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("heartbeat").expect("get job");
+
+        let claim = db
+            .claim_scheduled_run(job.id, when, next, when)
+            .expect("claim run");
+
+        assert!(matches!(claim, RunClaim::Claimed(_)));
+        assert_eq!(
+            db.get_job_by_name("heartbeat")
+                .expect("get updated job")
+                .next_run_at,
+            Some(next)
+        );
+        assert_eq!(
+            db.claim_scheduled_run(job.id, when, next, when)
+                .expect("stale claim"),
+            RunClaim::NotDue
+        );
+
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn claim_scheduled_run_skips_when_previous_run_is_active() {
+        let db = test_db();
+        let when = fixed_time();
+        let next = when + chrono::Duration::seconds(10);
+        db.add_job(
+            "heartbeat",
+            &["echo".into(), "alive".into()],
+            "every 10 seconds",
+            3600,
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("heartbeat").expect("get job");
+        db.create_run(job.id, "running", when, Some(when), "manual")
+            .expect("create active run");
+
+        let claim = db
+            .claim_scheduled_run(job.id, when, next, when)
+            .expect("claim skipped run");
+
+        let RunClaim::Skipped(run_id) = claim else {
+            panic!("expected skipped claim");
+        };
+        let history = db.history("heartbeat", 2).expect("history");
+        let skipped = history
+            .iter()
+            .find(|row| row.run_id == run_id)
+            .expect("skipped run in history");
+        assert_eq!(skipped.status, "skipped");
+        assert_eq!(skipped.error.as_deref(), Some("previous run still active"));
 
         let _ = fs::remove_file(db.path);
     }

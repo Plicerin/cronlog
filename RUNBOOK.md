@@ -106,6 +106,15 @@ Back up this file:
 /var/lib/cronlog/cronlog.db
 ```
 
+Optional log capture limits:
+
+```bash
+export CRONLOG_MAX_STDOUT_BYTES=262144
+export CRONLOG_MAX_STDERR_BYTES=262144
+```
+
+The defaults are 256 KiB per stream. Cronlog records `stdout_truncated` and `stderr_truncated` when output exceeds the configured limits.
+
 ## 6. Register Jobs
 
 Cronlog runs commands directly, not through a shell. If you need shell features such as `&&`, redirects, globs, or environment setup, call the shell explicitly.
@@ -315,6 +324,8 @@ Look for:
 - repeated `timed_out`, `failed`, `skipped`, or `interrupted` runs
 
 Cronlog marks stale `running` runs as `interrupted` when the daemon restarts. Treat that as a signal to inspect whether the job left partial output.
+
+Cronlog also claims each scheduled run inside a SQLite write transaction. If two daemon instances accidentally run against the same DB, only one should claim a due schedule slot; the other will see the slot as already claimed or not due. This is still not a recommendation to run multiple daemons intentionally.
 
 ## 11. Backup And Upgrade
 

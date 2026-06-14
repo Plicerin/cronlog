@@ -1,4 +1,4 @@
-﻿use crate::error::{CronlogError, Result};
+use crate::error::{CronlogError, Result};
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 
 #[derive(Debug, Clone)]
@@ -33,11 +33,6 @@ impl Schedule {
                 }
             }
         }
-    }
-
-    /// For missed runs, Cronlog MVP runs once then computes the next future occurrence.
-    pub fn next_future_after(&self, from: NaiveDateTime) -> Result<NaiveDateTime> {
-        self.next_after(from)
     }
 }
 

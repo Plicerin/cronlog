@@ -1,4 +1,4 @@
-﻿use crate::db::{Database, Job};
+use crate::db::{Database, HistoryRow, Job, RunClaim};
 use crate::error::Result;
 use crate::{runner, schedule};
 use chrono::Local;
@@ -14,27 +14,20 @@ pub fn run_daemon(db: &Database, poll_seconds: u64) -> Result<()> {
 
         for job in due_jobs {
             let scheduled_for = job.next_run_at.unwrap_or(now);
+            let next_run_at = next_run_after_scheduled_time(&job, scheduled_for, now)?;
 
-            if db.has_running_run(job.id)? {
-                let run_id = db.create_run(job.id, "skipped", scheduled_for, None, "schedule")?;
-                db.finish_run(
-                    run_id,
-                    "skipped",
-                    runner::now(),
-                    0,
-                    None,
-                    Some("previous run still active"),
-                )?;
-                update_next_run_from_now(db, &job)?;
-                println!(
-                    "Skipped '{}' because a previous run is still active",
-                    job.name
-                );
-                continue;
+            match db.claim_scheduled_run(job.id, scheduled_for, next_run_at, runner::now())? {
+                RunClaim::Claimed(run_id) => {
+                    run_claimed_job(db, &job, run_id, scheduled_for, "schedule")?;
+                }
+                RunClaim::Skipped(_) => {
+                    println!(
+                        "Skipped '{}' because a previous run is still active",
+                        job.name
+                    );
+                }
+                RunClaim::NotDue => {}
             }
-
-            run_job_once(db, &job, scheduled_for, "schedule")?;
-            update_next_run_from_now(db, &job)?;
         }
 
         thread::sleep(Duration::from_secs(poll_seconds.max(1)));
@@ -75,6 +68,38 @@ pub fn run_job_once(
         job.command.join(" ")
     );
 
+    execute_claimed_run(db, job, run_id, scheduled_for, trigger_type, previous)
+}
+
+fn run_claimed_job(
+    db: &Database,
+    job: &Job,
+    run_id: i64,
+    scheduled_for: chrono::NaiveDateTime,
+    trigger_type: &str,
+) -> Result<()> {
+    let previous = db
+        .history(&job.name, 2)?
+        .into_iter()
+        .find(|row| row.run_id != run_id);
+    println!(
+        "Starting job '{}' run #{}: {}",
+        job.name,
+        run_id,
+        job.command.join(" ")
+    );
+
+    execute_claimed_run(db, job, run_id, scheduled_for, trigger_type, previous)
+}
+
+fn execute_claimed_run(
+    db: &Database,
+    job: &Job,
+    run_id: i64,
+    scheduled_for: chrono::NaiveDateTime,
+    trigger_type: &str,
+    previous: Option<HistoryRow>,
+) -> Result<()> {
     let context = runner::ExecuteContext {
         run_id,
         job_name: job.name.clone(),
@@ -117,8 +142,69 @@ pub fn run_job_once(
     Ok(())
 }
 
-fn update_next_run_from_now(db: &Database, job: &Job) -> Result<()> {
+fn next_run_after_scheduled_time(
+    job: &Job,
+    scheduled_for: chrono::NaiveDateTime,
+    now: chrono::NaiveDateTime,
+) -> Result<chrono::NaiveDateTime> {
     let parsed = schedule::parse_schedule(&job.schedule)?;
-    let next = parsed.next_future_after(Local::now().naive_local())?;
-    db.update_next_run(job.id, next)
+    let mut next = parsed.next_after(scheduled_for)?;
+    while next <= now {
+        next = parsed.next_after(next)?;
+    }
+    Ok(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn job(schedule: &str) -> Job {
+        Job {
+            id: 1,
+            name: "heartbeat".into(),
+            command: vec!["echo".into(), "alive".into()],
+            schedule: schedule.into(),
+            timeout_seconds: 3600,
+            next_run_at: None,
+        }
+    }
+
+    fn at(hour: u32, minute: u32, second: u32) -> chrono::NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 6, 14)
+            .expect("valid date")
+            .and_hms_opt(hour, minute, second)
+            .expect("valid time")
+    }
+
+    #[test]
+    fn next_run_is_anchored_to_scheduled_time_not_finish_time() {
+        let scheduled_for = at(12, 0, 0);
+        let now_after_long_run = at(12, 5, 0);
+
+        let next = next_run_after_scheduled_time(
+            &job("every 10 minutes"),
+            scheduled_for,
+            now_after_long_run,
+        )
+        .expect("next run");
+
+        assert_eq!(next, at(12, 10, 0));
+    }
+
+    #[test]
+    fn next_run_skips_missed_intervals_without_drifting() {
+        let scheduled_for = at(12, 0, 0);
+        let now_after_outage = at(12, 35, 0);
+
+        let next = next_run_after_scheduled_time(
+            &job("every 10 minutes"),
+            scheduled_for,
+            now_after_outage,
+        )
+        .expect("next run");
+
+        assert_eq!(next, at(12, 40, 0));
+    }
 }
