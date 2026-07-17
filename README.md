@@ -1,4 +1,4 @@
-﻿# Cronlog MVP
+# Cronlog MVP
 
 Cronlog is a tiny SQLite-backed scheduler: cron's simple idea, with durable run history, captured logs, timeouts, and overlap protection.
 
@@ -20,6 +20,7 @@ Pipeline recovery still belongs in the pipeline. If a video workflow needs check
 
 ```bash
 cargo run -- add --name heartbeat --schedule "every 10 seconds" -- echo alive
+cargo run -- add --name pilot --schedule "every 1 hours" --max-runs 12 -- ./pipeline.sh
 cargo run -- list
 cargo run -- status
 cargo run -- daemon
@@ -52,6 +53,7 @@ Examples:
 ```bash
 cronlog add --name sync --schedule "every 15 minutes" -- ./sync.sh
 cronlog add --name backup --schedule "daily at 02:00" -- ./backup.sh
+cronlog add --name pilot --schedule "every 1 hours" --max-runs 12 -- ./pipeline.sh
 ```
 
 ## Defaults
@@ -64,6 +66,7 @@ cronlog add --name backup --schedule "daily at 02:00" -- ./backup.sh
 - Overlap behavior: forbid overlapping runs; skipped runs are recorded
 - Missed runs: run once, then compute the next future run
 - Daemon restart recovery: stale `running` runs are marked `interrupted` with a stderr log, then due jobs can run again normally
+- Bounded runs: optional `--max-runs N`; scheduled runs that actually start count, manual runs and overlap skips do not
 
 ## Build
 

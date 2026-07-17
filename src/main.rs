@@ -22,6 +22,7 @@ fn main() -> Result<()> {
             name,
             schedule,
             timeout,
+            max_runs,
             command,
         } => {
             if command.is_empty() {
@@ -32,8 +33,20 @@ fn main() -> Result<()> {
             let parsed = schedule::parse_schedule(&schedule)?;
             let next_run_at = parsed.next_after(chrono::Local::now().naive_local())?;
             let timeout_seconds = timeout.map(|d| d.as_secs() as i64).unwrap_or(3600);
-            db.add_job(&name, &command, &schedule, timeout_seconds, next_run_at)?;
-            println!("Added job '{name}' scheduled for {next_run_at}");
+            db.add_job(
+                &name,
+                &command,
+                &schedule,
+                timeout_seconds,
+                max_runs,
+                next_run_at,
+            )?;
+            match max_runs {
+                Some(limit) => println!(
+                    "Added job '{name}' scheduled for {next_run_at} (max {limit} scheduled runs)"
+                ),
+                None => println!("Added job '{name}' scheduled for {next_run_at}"),
+            }
         }
         Commands::List => {
             let jobs = db.list_jobs()?;

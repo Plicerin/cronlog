@@ -130,15 +130,24 @@ fn execute_claimed_run(
                 "Finished job '{}' run #{}: {}",
                 job.name, run_id, out.status
             );
+            disable_if_max_runs_reached(db, job.id)?;
         }
         Err(err) => {
             let message = err.to_string();
             db.finish_run(run_id, "failed", runner::now(), 0, None, Some(&message))?;
             db.insert_logs(run_id, "", &message, false, false)?;
             println!("Failed job '{}' run #{}: {}", job.name, run_id, message);
+            disable_if_max_runs_reached(db, job.id)?;
         }
     }
 
+    Ok(())
+}
+
+fn disable_if_max_runs_reached(db: &Database, job_id: i64) -> Result<()> {
+    if let Some((name, max_runs)) = db.disable_if_max_runs_reached(job_id)? {
+        println!("Disabled '{name}' after {max_runs} scheduled runs");
+    }
     Ok(())
 }
 
@@ -167,6 +176,7 @@ mod tests {
             command: vec!["echo".into(), "alive".into()],
             schedule: schedule.into(),
             timeout_seconds: 3600,
+            max_runs: None,
             next_run_at: None,
         }
     }

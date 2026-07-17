@@ -149,6 +149,19 @@ cronlog --db "$CRONLOG_DB" add \
   -- bash -lc 'cd /srv/content-agent && . .venv/bin/activate && python pipeline.py'
 ```
 
+Bounded pilot that runs at most 12 scheduled starts, then disables itself:
+
+```bash
+cronlog --db "$CRONLOG_DB" add \
+  --name content-pipeline-pilot \
+  --schedule "every 1 hours" \
+  --timeout 45m \
+  --max-runs 12 \
+  -- bash -lc 'cd /srv/content-agent && . .venv/bin/activate && python pipeline.py'
+```
+
+Manual runs with `cronlog run <name> --now` and overlap skips do not count against `--max-runs`.
+
 ## 7. Replace Existing Cron Entries
 
 List current cron jobs:
@@ -318,6 +331,7 @@ cronlog --db "$CRONLOG_DB" --json status
 
 Look for:
 
+- `scheduled_runs`, `max_runs`, and `remaining_runs` on bounded pilots
 - `last_status` not equal to `success`
 - `running_runs` greater than `0` for longer than expected
 - `last_finished_at` older than expected

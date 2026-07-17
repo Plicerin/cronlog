@@ -1,4 +1,4 @@
-﻿use crate::db::{HistoryRow, JobListRow, LogRow, StatusRow};
+use crate::db::{HistoryRow, JobListRow, LogRow, StatusRow};
 use comfy_table::{presets::UTF8_FULL, Cell, Table};
 use serde::Serialize;
 
@@ -10,7 +10,9 @@ pub fn print_json<T: Serialize>(value: &T) -> crate::error::Result<()> {
 pub fn print_jobs(jobs: &[JobListRow]) {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(vec!["Name", "Enabled", "Schedule", "Next Run", "Command"]);
+    table.set_header(vec![
+        "Name", "Enabled", "Schedule", "Next Run", "Runs", "Command",
+    ]);
 
     for job in jobs {
         table.add_row(vec![
@@ -22,11 +24,19 @@ pub fn print_jobs(jobs: &[JobListRow]) {
                     .map(|d| d.to_string())
                     .unwrap_or_else(|| "-".into()),
             ),
+            Cell::new(format_runs(job.scheduled_runs, job.max_runs)),
             Cell::new(&job.command),
         ]);
     }
 
     println!("{table}");
+}
+
+fn format_runs(scheduled_runs: i64, max_runs: Option<i64>) -> String {
+    match max_runs {
+        Some(max) => format!("{scheduled_runs}/{max}"),
+        None => scheduled_runs.to_string(),
+    }
 }
 
 pub fn print_history(rows: &[HistoryRow]) {
@@ -90,6 +100,7 @@ pub fn print_status(rows: &[StatusRow]) {
         "Schedule",
         "Next Run",
         "Running",
+        "Runs",
         "Last Run",
         "Last Status",
         "Last Finished",
@@ -108,6 +119,7 @@ pub fn print_status(rows: &[StatusRow]) {
                     .unwrap_or_else(|| "-".into()),
             ),
             Cell::new(row.running_runs),
+            Cell::new(format_runs(row.scheduled_runs, row.max_runs)),
             Cell::new(
                 row.last_run_id
                     .map(|id| id.to_string())

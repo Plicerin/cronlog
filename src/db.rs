@@ -1,4 +1,4 @@
-﻿use crate::error::{CronlogError, Result};
+use crate::error::{CronlogError, Result};
 use chrono::NaiveDateTime;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -11,6 +11,7 @@ pub struct Job {
     pub command: Vec<String>,
     pub schedule: String,
     pub timeout_seconds: i64,
+    pub max_runs: Option<i64>,
     pub next_run_at: Option<NaiveDateTime>,
 }
 
@@ -21,6 +22,9 @@ pub struct JobListRow {
     pub schedule: String,
     pub enabled: bool,
     pub next_run_at: Option<NaiveDateTime>,
+    pub max_runs: Option<i64>,
+    pub scheduled_runs: i64,
+    pub remaining_runs: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +67,9 @@ pub struct StatusRow {
     pub enabled: bool,
     pub schedule: String,
     pub next_run_at: Option<NaiveDateTime>,
+    pub max_runs: Option<i64>,
+    pub scheduled_runs: i64,
+    pub remaining_runs: Option<i64>,
     pub running_runs: i64,
     pub last_run_id: Option<i64>,
     pub last_status: Option<String>,
@@ -103,6 +110,7 @@ impl Database {
                 schedule TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 timeout_seconds INTEGER NOT NULL DEFAULT 3600,
+                max_runs INTEGER,
                 next_run_at TEXT,
                 deleted_at TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -137,6 +145,9 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_runs_job_started ON runs(job_id, started_at);
             "#,
         )?;
+        if !jobs_has_column(&conn, "max_runs")? {
+            conn.execute("ALTER TABLE jobs ADD COLUMN max_runs INTEGER", [])?;
+        }
         Ok(())
     }
 
@@ -146,13 +157,14 @@ impl Database {
         command: &[String],
         schedule: &str,
         timeout_seconds: i64,
+        max_runs: Option<i64>,
         next_run_at: NaiveDateTime,
     ) -> Result<()> {
         let conn = self.conn()?;
         let command_joined = shell_words::join(command.iter().map(String::as_str));
         conn.execute(
-            "INSERT INTO jobs (name, command, schedule, timeout_seconds, next_run_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![name, command_joined, schedule, timeout_seconds, next_run_at.to_string()],
+            "INSERT INTO jobs (name, command, schedule, timeout_seconds, max_runs, next_run_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![name, command_joined, schedule, timeout_seconds, max_runs, next_run_at.to_string()],
         )?;
         Ok(())
     }
@@ -160,7 +172,11 @@ impl Database {
     pub fn list_jobs(&self) -> Result<Vec<JobListRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT name, command, schedule, enabled, next_run_at FROM jobs WHERE deleted_at IS NULL ORDER BY name"
+            "SELECT j.name, j.command, j.schedule, j.enabled, j.next_run_at, j.max_runs,
+                    (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.trigger_type = 'schedule' AND rr.status NOT IN ('running', 'skipped')) AS scheduled_runs
+             FROM jobs j
+             WHERE j.deleted_at IS NULL
+             ORDER BY j.name"
         )?;
         let rows = stmt.query_map([], |row| {
             let next: Option<String> = row.get(4)?;
@@ -170,6 +186,9 @@ impl Database {
                 schedule: row.get(2)?,
                 enabled: row.get::<_, i64>(3)? == 1,
                 next_run_at: parse_dt_opt(next),
+                max_runs: row.get(5)?,
+                scheduled_runs: row.get(6)?,
+                remaining_runs: remaining_runs(row.get(5)?, row.get(6)?),
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -180,7 +199,8 @@ impl Database {
         let conn = self.conn()?;
         let (sql, bind_name) = if name.is_some() {
             (
-                "SELECT j.name, j.enabled, j.schedule, j.next_run_at,
+                "SELECT j.name, j.enabled, j.schedule, j.next_run_at, j.max_runs,
+                        (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.trigger_type = 'schedule' AND rr.status NOT IN ('running', 'skipped')) AS scheduled_runs,
                         (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.status = 'running') AS running_runs,
                         r.id, r.status, r.trigger_type, r.scheduled_for, r.started_at, r.finished_at, r.duration_ms, r.exit_code, r.error
                  FROM jobs j
@@ -191,7 +211,8 @@ impl Database {
             )
         } else {
             (
-                "SELECT j.name, j.enabled, j.schedule, j.next_run_at,
+                "SELECT j.name, j.enabled, j.schedule, j.next_run_at, j.max_runs,
+                        (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.trigger_type = 'schedule' AND rr.status NOT IN ('running', 'skipped')) AS scheduled_runs,
                         (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.status = 'running') AS running_runs,
                         r.id, r.status, r.trigger_type, r.scheduled_for, r.started_at, r.finished_at, r.duration_ms, r.exit_code, r.error
                  FROM jobs j
@@ -209,16 +230,19 @@ impl Database {
                 enabled: row.get::<_, i64>(1)? == 1,
                 schedule: row.get(2)?,
                 next_run_at: parse_dt_opt(row.get::<_, Option<String>>(3)?),
-                running_runs: row.get(4)?,
-                last_run_id: row.get(5)?,
-                last_status: row.get(6)?,
-                last_trigger_type: row.get(7)?,
-                last_scheduled_for: parse_dt_opt(row.get::<_, Option<String>>(8)?),
-                last_started_at: parse_dt_opt(row.get::<_, Option<String>>(9)?),
-                last_finished_at: parse_dt_opt(row.get::<_, Option<String>>(10)?),
-                last_duration_ms: row.get(11)?,
-                last_exit_code: row.get(12)?,
-                last_error: row.get(13)?,
+                max_runs: row.get(4)?,
+                scheduled_runs: row.get(5)?,
+                remaining_runs: remaining_runs(row.get(4)?, row.get(5)?),
+                running_runs: row.get(6)?,
+                last_run_id: row.get(7)?,
+                last_status: row.get(8)?,
+                last_trigger_type: row.get(9)?,
+                last_scheduled_for: parse_dt_opt(row.get::<_, Option<String>>(10)?),
+                last_started_at: parse_dt_opt(row.get::<_, Option<String>>(11)?),
+                last_finished_at: parse_dt_opt(row.get::<_, Option<String>>(12)?),
+                last_duration_ms: row.get(13)?,
+                last_exit_code: row.get(14)?,
+                last_error: row.get(15)?,
             })
         };
 
@@ -243,7 +267,7 @@ impl Database {
     pub fn get_due_jobs(&self, now: NaiveDateTime) -> Result<Vec<Job>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, command, schedule, enabled, timeout_seconds, next_run_at
+            "SELECT id, name, command, schedule, enabled, timeout_seconds, max_runs, next_run_at
              FROM jobs
              WHERE enabled = 1 AND deleted_at IS NULL AND next_run_at IS NOT NULL AND next_run_at <= ?1
              ORDER BY next_run_at ASC"
@@ -256,7 +280,7 @@ impl Database {
     pub fn get_job_by_name(&self, name: &str) -> Result<Job> {
         let conn = self.conn()?;
         conn.query_row(
-            "SELECT id, name, command, schedule, enabled, timeout_seconds, next_run_at FROM jobs WHERE name = ?1 AND deleted_at IS NULL",
+            "SELECT id, name, command, schedule, enabled, timeout_seconds, max_runs, next_run_at FROM jobs WHERE name = ?1 AND deleted_at IS NULL",
             params![name],
             row_to_job,
         ).optional()?.ok_or_else(|| CronlogError::NotFound(format!("job '{name}'")))
@@ -272,14 +296,36 @@ impl Database {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let current_next = tx
+        let job_state = tx
             .query_row(
-                "SELECT next_run_at FROM jobs WHERE id = ?1 AND enabled = 1 AND deleted_at IS NULL",
+                "SELECT j.next_run_at, j.max_runs,
+                        (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.trigger_type = 'schedule' AND rr.status NOT IN ('running', 'skipped')) AS scheduled_runs
+                 FROM jobs j
+                 WHERE j.id = ?1 AND j.enabled = 1 AND j.deleted_at IS NULL",
                 params![job_id],
-                |row| row.get::<_, Option<String>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
             )
-            .optional()?
-            .flatten();
+            .optional()?;
+
+        let Some((current_next, max_runs, scheduled_runs)) = job_state else {
+            tx.commit()?;
+            return Ok(RunClaim::NotDue);
+        };
+
+        if max_runs.is_some_and(|max| scheduled_runs >= max) {
+            tx.execute(
+                "UPDATE jobs SET enabled = 0, next_run_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![job_id],
+            )?;
+            tx.commit()?;
+            return Ok(RunClaim::NotDue);
+        }
 
         if parse_dt_opt(current_next) != Some(scheduled_for) {
             tx.commit()?;
@@ -396,6 +442,40 @@ impl Database {
         Ok(interrupted)
     }
 
+    pub fn disable_if_max_runs_reached(&self, job_id: i64) -> Result<Option<(String, i64)>> {
+        let conn = self.conn()?;
+        let state = conn
+            .query_row(
+                "SELECT j.name, j.enabled, j.max_runs,
+                        (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.trigger_type = 'schedule' AND rr.status NOT IN ('running', 'skipped')) AS scheduled_runs
+                 FROM jobs j
+                 WHERE j.id = ?1 AND j.deleted_at IS NULL",
+                params![job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? == 1,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((name, enabled, Some(max_runs), scheduled_runs)) = state else {
+            return Ok(None);
+        };
+        if !enabled || scheduled_runs < max_runs {
+            return Ok(None);
+        }
+
+        conn.execute(
+            "UPDATE jobs SET enabled = 0, next_run_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![job_id],
+        )?;
+        Ok(Some((name, max_runs)))
+    }
+
     pub fn insert_logs(
         &self,
         run_id: i64,
@@ -510,15 +590,31 @@ impl Database {
 fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let command_str: String = row.get(2)?;
     let command = shell_words::split(&command_str).unwrap_or_else(|_| vec![command_str]);
-    let next: Option<String> = row.get(6)?;
+    let next: Option<String> = row.get(7)?;
     Ok(Job {
         id: row.get(0)?,
         name: row.get(1)?,
         command,
         schedule: row.get(3)?,
         timeout_seconds: row.get(5)?,
+        max_runs: row.get(6)?,
         next_run_at: parse_dt_opt(next),
     })
+}
+
+fn remaining_runs(max_runs: Option<i64>, scheduled_runs: i64) -> Option<i64> {
+    max_runs.map(|max| (max - scheduled_runs).max(0))
+}
+
+fn jobs_has_column(conn: &Connection, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(jobs)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn parse_dt_opt(input: Option<String>) -> Option<NaiveDateTime> {
@@ -563,6 +659,7 @@ mod tests {
             &["echo".into(), "alive".into()],
             "every 10 seconds",
             3600,
+            None,
             when,
         )
         .expect("add job");
@@ -606,6 +703,7 @@ mod tests {
             &["echo".into(), "alive".into()],
             "every 10 seconds",
             3600,
+            None,
             when,
         )
         .expect("add job");
@@ -648,6 +746,7 @@ mod tests {
             &["echo".into(), "alive".into()],
             "every 10 seconds",
             3600,
+            None,
             when,
         )
         .expect("add job");
@@ -682,6 +781,7 @@ mod tests {
             &["echo".into(), "alive".into()],
             "every 10 seconds",
             3600,
+            None,
             when,
         )
         .expect("add job");
@@ -717,6 +817,7 @@ mod tests {
             &["echo".into(), "alive".into()],
             "every 10 seconds",
             3600,
+            None,
             when,
         )
         .expect("add job");
@@ -738,6 +839,112 @@ mod tests {
             .expect("skipped run in history");
         assert_eq!(skipped.status, "skipped");
         assert_eq!(skipped.error.as_deref(), Some("previous run still active"));
+
+        let _ = fs::remove_file(db.path);
+    }
+    #[test]
+    fn max_runs_report_count_and_remaining_runs() {
+        let db = test_db();
+        let when = fixed_time();
+        db.add_job(
+            "bounded",
+            &["echo".into(), "alive".into()],
+            "every 10 seconds",
+            3600,
+            Some(2),
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("bounded").expect("get job");
+
+        let manual = db
+            .create_run(job.id, "success", when, Some(when), "manual")
+            .expect("create manual run");
+        db.finish_run(manual, "success", when, 10, Some(0), None)
+            .expect("finish manual run");
+        db.create_run(job.id, "skipped", when, None, "schedule")
+            .expect("create skipped run");
+        let scheduled = db
+            .create_run(job.id, "running", when, Some(when), "schedule")
+            .expect("create scheduled run");
+        db.finish_run(scheduled, "success", when, 10, Some(0), None)
+            .expect("finish scheduled run");
+
+        let jobs = db.list_jobs().expect("list jobs");
+        assert_eq!(jobs[0].max_runs, Some(2));
+        assert_eq!(jobs[0].scheduled_runs, 1);
+        assert_eq!(jobs[0].remaining_runs, Some(1));
+
+        let status = db.status(Some("bounded")).expect("status");
+        assert_eq!(status[0].max_runs, Some(2));
+        assert_eq!(status[0].scheduled_runs, 1);
+        assert_eq!(status[0].remaining_runs, Some(1));
+
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn disable_if_max_runs_reached_disables_bounded_job() {
+        let db = test_db();
+        let when = fixed_time();
+        db.add_job(
+            "bounded",
+            &["echo".into(), "alive".into()],
+            "every 10 seconds",
+            3600,
+            Some(1),
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("bounded").expect("get job");
+        let run = db
+            .create_run(job.id, "running", when, Some(when), "schedule")
+            .expect("create scheduled run");
+        db.finish_run(run, "failed", when, 10, Some(1), Some("boom"))
+            .expect("finish scheduled run");
+
+        let disabled = db
+            .disable_if_max_runs_reached(job.id)
+            .expect("disable bounded job");
+
+        assert_eq!(disabled, Some(("bounded".into(), 1)));
+        let status = db.status(Some("bounded")).expect("status");
+        assert!(!status[0].enabled);
+        assert_eq!(status[0].next_run_at, None);
+        assert_eq!(status[0].remaining_runs, Some(0));
+
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn claim_scheduled_run_disables_job_after_limit_is_already_reached() {
+        let db = test_db();
+        let when = fixed_time();
+        let next = when + chrono::Duration::seconds(10);
+        db.add_job(
+            "bounded",
+            &["echo".into(), "alive".into()],
+            "every 10 seconds",
+            3600,
+            Some(1),
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("bounded").expect("get job");
+        let run = db
+            .create_run(job.id, "running", when, Some(when), "schedule")
+            .expect("create scheduled run");
+        db.finish_run(run, "success", when, 10, Some(0), None)
+            .expect("finish scheduled run");
+
+        let claim = db
+            .claim_scheduled_run(job.id, when, next, when)
+            .expect("claim after limit");
+
+        assert_eq!(claim, RunClaim::NotDue);
+        let status = db.status(Some("bounded")).expect("status");
+        assert!(!status[0].enabled);
+        assert_eq!(status[0].next_run_at, None);
 
         let _ = fs::remove_file(db.path);
     }

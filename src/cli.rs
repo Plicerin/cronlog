@@ -1,8 +1,18 @@
-﻿use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use std::time::Duration;
 
 fn parse_duration(input: &str) -> std::result::Result<Duration, String> {
     humantime::parse_duration(input).map_err(|e| e.to_string())
+}
+
+fn parse_positive_i64(input: &str) -> std::result::Result<i64, String> {
+    let value = input
+        .parse::<i64>()
+        .map_err(|_| format!("expected positive integer, got '{input}'"))?;
+    if value <= 0 {
+        return Err("value must be greater than zero".into());
+    }
+    Ok(value)
 }
 
 #[derive(Parser, Debug)]
@@ -35,6 +45,10 @@ pub enum Commands {
         /// Job timeout, for example 30s, 5m, 1h
         #[arg(long, value_parser = parse_duration)]
         timeout: Option<Duration>,
+
+        /// Disable the job after N scheduled runs that actually start
+        #[arg(long, value_parser = parse_positive_i64)]
+        max_runs: Option<i64>,
 
         /// Command and arguments to run. Put this after --
         #[arg(last = true, required = true)]
