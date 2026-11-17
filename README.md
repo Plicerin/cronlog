@@ -1,5 +1,7 @@
 # Cronlog MVP
 
+[![CI](https://github.com/Plicerin/cronlog/actions/workflows/ci.yml/badge.svg)](https://github.com/Plicerin/cronlog/actions/workflows/ci.yml)
+
 Cronlog is a tiny SQLite-backed scheduler: cron's simple idea, with durable run history, captured logs, timeouts, and overlap protection.
 
 ## Scope

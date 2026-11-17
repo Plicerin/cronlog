@@ -197,12 +197,8 @@ pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
         });
     }
 
-    let status = wait_result.ok_or_else(|| {
-        CronlogError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "process status unavailable",
-        ))
-    })?;
+    let status = wait_result
+        .ok_or_else(|| CronlogError::Io(std::io::Error::other("process status unavailable")))?;
     let exit_code = status.code().map(|c| c as i64);
     let run_status = if exit_code == Some(0) {
         "success"
@@ -361,7 +357,7 @@ impl<T: Read + std::os::windows::io::AsRawHandle> PollRead for T {
             // SAFETY: peeks a pipe handle this value owns; only the count is written.
             let ok = unsafe {
                 PeekNamedPipe(
-                    self.as_raw_handle() as *mut std::ffi::c_void,
+                    self.as_raw_handle(),
                     std::ptr::null_mut(),
                     0,
                     std::ptr::null_mut(),

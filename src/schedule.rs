@@ -102,6 +102,18 @@ trait DateParts {
     fn day(&self) -> u32;
 }
 
+impl DateParts for chrono::NaiveDate {
+    fn year(&self) -> i32 {
+        chrono::Datelike::year(self)
+    }
+    fn month(&self) -> u32 {
+        chrono::Datelike::month(self)
+    }
+    fn day(&self) -> u32 {
+        chrono::Datelike::day(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,17 +168,5 @@ mod tests {
             schedule.first_after(previous, now).unwrap(),
             dt("2026-11-17 12:00:00.500")
         );
-    }
-}
-
-impl DateParts for chrono::NaiveDate {
-    fn year(&self) -> i32 {
-        chrono::Datelike::year(self)
-    }
-    fn month(&self) -> u32 {
-        chrono::Datelike::month(self)
-    }
-    fn day(&self) -> u32 {
-        chrono::Datelike::day(self)
     }
 }
