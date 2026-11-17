@@ -1,4 +1,4 @@
-use crate::db::{Database, HistoryRow, Job, PruneReport, RunClaim, RECLAIM_CHUNK_PAGES};
+use crate::db::{Database, HistoryRow, Job, PruneReport, RunClaim, RunResult, RECLAIM_CHUNK_PAGES};
 use crate::error::Result;
 use crate::{runner, schedule};
 use chrono::Local;
@@ -99,14 +99,15 @@ impl Pruner {
                 if (batch.runs as i64) == PRUNE_BATCH {
                     return; // more to do; next tick
                 }
-                if self.pass.runs == 0 {
-                    self.finish_pass();
-                    return;
+                if self.pass.runs > 0 {
+                    println!(
+                        "Pruned {} runs scheduled before {cutoff} (kept each job's newest {})",
+                        self.pass.runs, self.retention.keep_last
+                    );
                 }
-                println!(
-                    "Pruned {} runs scheduled before {cutoff} (kept each job's newest {})",
-                    self.pass.runs, self.retention.keep_last
-                );
+                // Reclaim even when nothing was deleted this pass: pages freed before a
+                // restart or a failed reclaim would otherwise never be handed back. With
+                // no free pages this is one quick step.
                 self.reclaiming = true;
             }
             Err(err) => {
@@ -308,20 +309,19 @@ fn execute_claimed_run(
 
     match runner::execute(job, &context) {
         Ok(out) => {
-            db.finish_run(
+            db.record_result(
                 run_id,
-                &out.status,
-                runner::now(),
-                out.duration_ms,
-                out.exit_code,
-                out.error.as_deref(),
-            )?;
-            db.insert_logs(
-                run_id,
-                &out.stdout,
-                &out.stderr,
-                out.stdout_truncated,
-                out.stderr_truncated,
+                &RunResult {
+                    status: &out.status,
+                    finished_at: runner::now(),
+                    duration_ms: out.duration_ms,
+                    exit_code: out.exit_code,
+                    error: out.error.as_deref(),
+                    stdout: &out.stdout,
+                    stderr: &out.stderr,
+                    stdout_truncated: out.stdout_truncated,
+                    stderr_truncated: out.stderr_truncated,
+                },
             )?;
             println!(
                 "Finished job '{}' run #{}: {}",
@@ -331,8 +331,20 @@ fn execute_claimed_run(
         }
         Err(err) => {
             let message = err.to_string();
-            db.finish_run(run_id, "failed", runner::now(), 0, None, Some(&message))?;
-            db.insert_logs(run_id, "", &message, false, false)?;
+            db.record_result(
+                run_id,
+                &RunResult {
+                    status: "failed",
+                    finished_at: runner::now(),
+                    duration_ms: 0,
+                    exit_code: None,
+                    error: Some(&message),
+                    stdout: "",
+                    stderr: &message,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+            )?;
             println!("Failed job '{}' run #{}: {}", job.name, run_id, message);
             disable_if_max_runs_reached(db, job.id)?;
         }
@@ -634,6 +646,75 @@ mod tests {
             after < before / 4,
             "expected most of {before} bytes back, still {after}"
         );
+    }
+
+    #[test]
+    fn the_daemon_reclaims_pages_left_from_an_earlier_pass() {
+        let db = test_db();
+        let now = at(12, 0, 0);
+        db.add_job("big", &quick_command(), "every 1 hours", 60, None, now)
+            .expect("add");
+        let job = db.get_job_by_name("big").expect("job");
+        let output = "x".repeat(20_000);
+        for _ in 0..30 {
+            let id = db
+                .create_run(job.id, "running", days_before(now, 10), None, "schedule")
+                .expect("run");
+            db.finish_run(id, "success", days_before(now, 10), 0, Some(0), None)
+                .expect("finish");
+            db.insert_logs(id, &output, "", false, false).expect("logs");
+        }
+        let retention = Retention {
+            max_age: chrono::Duration::days(1),
+            keep_last: 1,
+        };
+        // Deleted, but the daemon stopped before handing the pages back.
+        prune_history(&db, retention, now).expect("prune");
+        let before = db.size_bytes().expect("size");
+
+        // A fresh daemon finds nothing to delete, and still reclaims the leftover pages.
+        let mut pruner = Pruner::new(retention);
+        for _ in 0..10 {
+            pruner.tick(&db, now);
+        }
+        assert!(!pruner.reclaiming, "pass should have finished");
+        assert!(
+            db.size_bytes().expect("size") < before / 4,
+            "leftover pages were not reclaimed"
+        );
+    }
+
+    #[test]
+    fn a_result_is_recorded_whole_or_not_at_all() {
+        let db = test_db();
+        let now = at(12, 0, 0);
+        db.add_job("a", &quick_command(), "every 1 hours", 60, None, now)
+            .expect("add");
+        let job = db.get_job_by_name("a").expect("job");
+        let id = db
+            .create_run(job.id, "running", now, Some(now), "schedule")
+            .expect("run");
+        let result = RunResult {
+            status: "success",
+            finished_at: now,
+            duration_ms: 5,
+            exit_code: Some(0),
+            error: None,
+            stdout: "hello",
+            stderr: "",
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        db.record_result(id, &result).expect("record");
+        assert_eq!(last_status(&db, "a"), "success");
+        assert_eq!(
+            db.logs_for_run(id).expect("logs").stdout.as_deref(),
+            Some("hello")
+        );
+
+        // A run that is gone (as if pruned) is an error, and no orphan log row is left.
+        assert!(db.record_result(id + 1000, &result).is_err());
+        assert!(db.logs_for_run(id + 1000).is_err());
     }
 
     #[test]

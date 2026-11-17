@@ -82,6 +82,20 @@ pub struct StatusRow {
     pub last_error: Option<String>,
 }
 
+/// A finished run's outcome and captured output, recorded together.
+#[derive(Debug)]
+pub struct RunResult<'a> {
+    pub status: &'a str,
+    pub finished_at: NaiveDateTime,
+    pub duration_ms: i64,
+    pub exit_code: Option<i64>,
+    pub error: Option<&'a str>,
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
 /// What one prune pass removed.
 #[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct PruneReport {
@@ -91,15 +105,38 @@ pub struct PruneReport {
 
 /// One job's runs old enough to delete: job ?1, scheduled before the cutoff ?2, and older
 /// than the job's keep-last boundary run (?3 scheduled_for, ?4 id). Never a `running` run.
-/// With ?5 set (a live job with `--max-runs`), never the scheduled runs that count toward
-/// its limit, since the limit is enforced by counting those rows.
 ///
 /// Age is `scheduled_for`, the one timestamp every run has (an overlap skip has no
-/// `started_at`), so idx_runs_job_scheduled limits the scan to the job's old rows.
-const PRUNABLE_FOR_JOB: &str = "FROM runs
+/// `started_at`). Each query is a range scan on an index whose rows are nearly all
+/// deletable, so the rows examined stay close to the rows deleted: at most keep-last plus
+/// any `running` runs are scanned and kept.
+const PRUNABLE_FOR_JOB: &str = "FROM runs INDEXED BY idx_runs_job_scheduled
     WHERE job_id = ?1 AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
-      AND status <> 'running'
-      AND NOT (?5 AND trigger_type = 'schedule' AND status NOT IN ('running', 'skipped'))";
+      AND status <> 'running'";
+
+/// For a live job with `--max-runs`: its limit is enforced by counting its scheduled,
+/// started runs, so only its overlap skips and its manual runs may go. Separate indexed
+/// queries for each, so the kept counted runs are never scanned. INDEXED BY pins the
+/// index: left to itself SQLite picks idx_runs_job_scheduled and walks those runs.
+const PRUNABLE_SKIPS_FOR_BOUNDED_JOB: &str = "FROM runs INDEXED BY idx_runs_job_trigger_status
+    WHERE job_id = ?1 AND trigger_type = 'schedule' AND status = 'skipped'
+      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)";
+const PRUNABLE_MANUAL_FOR_BOUNDED_JOB: &str = "FROM runs INDEXED BY idx_runs_job_trigger_status
+    WHERE job_id = ?1 AND trigger_type = 'manual'
+      AND status IN ('success', 'failed', 'timed_out', 'interrupted', 'skipped')
+      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)";
+
+/// The prunable-run filters for one job.
+fn prunable_filters(protect_counted: bool) -> &'static [&'static str] {
+    if protect_counted {
+        &[
+            PRUNABLE_SKIPS_FOR_BOUNDED_JOB,
+            PRUNABLE_MANUAL_FOR_BOUNDED_JOB,
+        ]
+    } else {
+        &[PRUNABLE_FOR_JOB]
+    }
+}
 
 /// Pages handed back to the filesystem per step (about 4 MB at SQLite's default 4 KB page
 /// size). Each step is its own short write transaction.
@@ -194,6 +231,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_runs_job_started ON runs(job_id, started_at);
             CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
             CREATE INDEX IF NOT EXISTS idx_runs_job_scheduled ON runs(job_id, scheduled_for);
+            CREATE INDEX IF NOT EXISTS idx_runs_job_trigger_status
+                ON runs(job_id, trigger_type, status, scheduled_for);
             "#,
         )?;
         if !jobs_has_column(&conn, "max_runs")? {
@@ -430,6 +469,41 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Record a run's outcome and its captured output in one transaction. The run stays
+    /// `running` until this commits, and pruning never touches a `running` run, so it can
+    /// never delete a run between its status and its logs.
+    pub fn record_result(&self, run_id: i64, result: &RunResult<'_>) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE runs SET status = ?1, finished_at = ?2, duration_ms = ?3, exit_code = ?4, error = ?5 WHERE id = ?6",
+            params![
+                result.status,
+                result.finished_at.to_string(),
+                result.duration_ms,
+                result.exit_code,
+                result.error,
+                run_id
+            ],
+        )?;
+        if updated == 0 {
+            return Err(CronlogError::NotFound(format!("run {run_id}")));
+        }
+        tx.execute(
+            "INSERT INTO logs (run_id, stdout, stderr, stdout_truncated, stderr_truncated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                run_id,
+                result.stdout,
+                result.stderr,
+                result.stdout_truncated as i64,
+                result.stderr_truncated as i64
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn finish_run(
         &self,
         run_id: i64,
@@ -553,6 +627,7 @@ impl Database {
         Ok(Some((name, max_runs)))
     }
 
+    #[cfg(test)]
     pub fn insert_logs(
         &self,
         run_id: i64,
@@ -584,30 +659,31 @@ impl Database {
         let cutoff = cutoff.to_string();
         let mut report = PruneReport::default();
         {
-            let mut select = tx.prepare(&format!("SELECT id {PRUNABLE_FOR_JOB} LIMIT ?6"))?;
             let mut delete_logs = tx.prepare("DELETE FROM logs WHERE run_id = ?1")?;
             let mut delete_run = tx.prepare("DELETE FROM runs WHERE id = ?1")?;
-            for target in prune_targets(&tx, keep_last)? {
-                let room = batch - report.runs as i64;
-                if room <= 0 {
-                    break;
-                }
-                let ids = select
-                    .query_map(
-                        params![
-                            target.job_id,
-                            cutoff,
-                            target.boundary_scheduled_for,
-                            target.boundary_id,
-                            target.protect_counted,
-                            room
-                        ],
-                        |row| row.get::<_, i64>(0),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                for id in ids {
-                    report.logs += delete_logs.execute([id])?;
-                    report.runs += delete_run.execute([id])?;
+            'jobs: for target in prune_targets(&tx, keep_last)? {
+                for filter in prunable_filters(target.protect_counted) {
+                    let room = batch - report.runs as i64;
+                    if room <= 0 {
+                        break 'jobs;
+                    }
+                    let ids = tx
+                        .prepare_cached(&format!("SELECT id {filter} LIMIT ?5"))?
+                        .query_map(
+                            params![
+                                target.job_id,
+                                cutoff,
+                                target.boundary_scheduled_for,
+                                target.boundary_id,
+                                room
+                            ],
+                            |row| row.get::<_, i64>(0),
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for id in ids {
+                        report.logs += delete_logs.execute([id])?;
+                        report.runs += delete_run.execute([id])?;
+                    }
                 }
             }
         }
@@ -619,19 +695,21 @@ impl Database {
     pub fn count_prunable(&self, cutoff: NaiveDateTime, keep_last: i64) -> Result<i64> {
         let conn = self.conn()?;
         let cutoff = cutoff.to_string();
-        let mut count = conn.prepare(&format!("SELECT COUNT(*) {PRUNABLE_FOR_JOB}"))?;
         let mut total = 0;
         for target in prune_targets(&conn, keep_last)? {
-            total += count.query_row(
-                params![
-                    target.job_id,
-                    cutoff,
-                    target.boundary_scheduled_for,
-                    target.boundary_id,
-                    target.protect_counted
-                ],
-                |row| row.get::<_, i64>(0),
-            )?;
+            for filter in prunable_filters(target.protect_counted) {
+                total += conn
+                    .prepare_cached(&format!("SELECT COUNT(*) {filter}"))?
+                    .query_row(
+                        params![
+                            target.job_id,
+                            cutoff,
+                            target.boundary_scheduled_for,
+                            target.boundary_id
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+            }
         }
         Ok(total)
     }
@@ -924,22 +1002,29 @@ mod tests {
     #[test]
     fn pruning_reads_only_each_jobs_old_rows_through_an_index() {
         let db = test_db();
-        let select = query_plan(
-            &db,
-            &format!("SELECT id {PRUNABLE_FOR_JOB} LIMIT ?6"),
-            params![
-                1,
-                "2026-01-01 00:00:00",
-                "2026-01-01 00:00:00",
-                1,
-                false,
-                500
-            ],
-        );
-        assert!(
-            select.contains("idx_runs_job_scheduled") && select.contains("scheduled_for<?"),
-            "candidate scan is not a range on the index: {select}"
-        );
+        let when = "2026-01-01 00:00:00";
+        for (filter, index) in [
+            (PRUNABLE_FOR_JOB, "idx_runs_job_scheduled"),
+            // A bounded job's kept counted runs must not be in the scanned range.
+            (
+                PRUNABLE_SKIPS_FOR_BOUNDED_JOB,
+                "idx_runs_job_trigger_status",
+            ),
+            (
+                PRUNABLE_MANUAL_FOR_BOUNDED_JOB,
+                "idx_runs_job_trigger_status",
+            ),
+        ] {
+            let select = query_plan(
+                &db,
+                &format!("SELECT id {filter} LIMIT ?5"),
+                params![1, when, when, 1, 500],
+            );
+            assert!(
+                select.contains(index) && select.contains("scheduled_for<?"),
+                "candidate scan is not a range on {index}: {select}"
+            );
+        }
         let boundary = query_plan(
             &db,
             "SELECT scheduled_for, id FROM runs WHERE job_id = ?1 AND scheduled_for IS NOT NULL
