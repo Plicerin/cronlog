@@ -86,8 +86,9 @@ pub fn enable_job(
     name: &str,
     now: chrono::NaiveDateTime,
 ) -> Result<chrono::NaiveDateTime> {
-    db.enable_job(name, |schedule, current_next| match current_next {
-        Some(next) if next > now => Ok(next),
+    db.enable_job(name, |schedule, enabled, current_next| match current_next {
+        // An already-enabled job is left as it is: its due slot still runs.
+        Some(next) if enabled || next > now => Ok(next),
         Some(previous) => first_slot_after(schedule, previous, now),
         None => schedule::parse_schedule(schedule)?.next_after(now),
     })
@@ -247,12 +248,7 @@ fn first_slot_after(
     previous: chrono::NaiveDateTime,
     now: chrono::NaiveDateTime,
 ) -> Result<chrono::NaiveDateTime> {
-    let parsed = schedule::parse_schedule(schedule)?;
-    let mut next = parsed.next_after(previous)?;
-    while next <= now {
-        next = parsed.next_after(next)?;
-    }
-    Ok(next)
+    schedule::parse_schedule(schedule)?.first_after(previous, now)
 }
 
 #[cfg(test)]
@@ -480,6 +476,25 @@ mod tests {
         assert_eq!(next, at(12, 40, 0));
         assert!(db.get_due_jobs(at(12, 35, 0)).expect("due").is_empty());
         assert_eq!(db.get_due_jobs(at(12, 40, 0)).expect("due").len(), 1);
+    }
+
+    #[test]
+    fn enabling_an_already_enabled_job_keeps_its_due_slot() {
+        let db = test_db();
+        db.add_job(
+            "digest",
+            &quick_command(),
+            "daily at 07:00",
+            60,
+            None,
+            at(7, 0, 0),
+        )
+        .expect("add");
+
+        // Due at 07:00, not yet picked up; `enable` at 07:01 must not push it to tomorrow.
+        let next = enable_job(&db, "digest", at(7, 1, 0)).expect("enable");
+        assert_eq!(next, at(7, 0, 0));
+        assert_eq!(db.get_due_jobs(at(7, 1, 0)).expect("due").len(), 1);
     }
 
     #[test]

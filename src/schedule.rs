@@ -34,6 +34,29 @@ impl Schedule {
             }
         }
     }
+
+    /// The first slot after `now` in the series that continues from `previous`, so
+    /// intervals keep their phase. Constant time however far behind `previous` is.
+    pub fn first_after(
+        &self,
+        previous: NaiveDateTime,
+        now: NaiveDateTime,
+    ) -> Result<NaiveDateTime> {
+        let next = self.next_after(previous)?;
+        if next > now {
+            return Ok(next);
+        }
+        match self {
+            Schedule::EverySeconds(seconds) => {
+                // now >= previous + seconds here, so the elapsed time is positive and
+                // whole seconds round down: previous + (k + 1) * seconds > now.
+                let skipped = (now - previous).num_seconds() / seconds;
+                Ok(previous + Duration::seconds((skipped + 1) * seconds))
+            }
+            // A daily slot's phase is its time of day.
+            Schedule::DailyAt(_) => self.next_after(now),
+        }
+    }
 }
 
 pub fn parse_schedule(input: &str) -> Result<Schedule> {
@@ -77,6 +100,63 @@ trait DateParts {
     fn year(&self) -> i32;
     fn month(&self) -> u32;
     fn day(&self) -> u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dt(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").expect("datetime")
+    }
+
+    /// The slot-by-slot walk `first_after` replaces.
+    fn walk(schedule: &Schedule, previous: NaiveDateTime, now: NaiveDateTime) -> NaiveDateTime {
+        let mut next = schedule.next_after(previous).unwrap();
+        while next <= now {
+            next = schedule.next_after(next).unwrap();
+        }
+        next
+    }
+
+    #[test]
+    fn first_after_matches_walking_slot_by_slot() {
+        let previous = dt("2026-11-17 12:00:00.250");
+        for schedule in [
+            Schedule::EverySeconds(1),
+            Schedule::EverySeconds(7),
+            Schedule::EverySeconds(600),
+            parse_schedule("daily at 07:00").unwrap(),
+        ] {
+            for now in [
+                "2026-11-17 11:59:59",
+                "2026-11-17 12:00:00.250",
+                "2026-11-17 12:29:59.900",
+                "2026-11-17 12:30:00.250",
+                "2026-11-17 12:35:00",
+                "2026-11-19 06:59:59",
+                "2026-11-19 07:00:00",
+            ] {
+                let now = dt(now);
+                assert_eq!(
+                    schedule.first_after(previous, now).unwrap(),
+                    walk(&schedule, previous, now),
+                    "{schedule:?} previous {previous} now {now}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_after_catches_up_a_year_at_once() {
+        let schedule = Schedule::EverySeconds(1);
+        let previous = dt("2025-11-17 12:00:00.500");
+        let now = dt("2026-11-17 12:00:00");
+        assert_eq!(
+            schedule.first_after(previous, now).unwrap(),
+            dt("2026-11-17 12:00:00.500")
+        );
+    }
 }
 
 impl DateParts for chrono::NaiveDate {

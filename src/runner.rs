@@ -54,7 +54,19 @@ struct Reader {
     captured: Arc<Mutex<Captured>>,
     cancel: Arc<AtomicBool>,
     done: mpsc::Receiver<()>,
-    handle: thread::JoinHandle<()>,
+    /// Taken by `collect`; still here if the run errored or unwound before collecting.
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for Reader {
+    /// A reader dropped without `collect` (an error or a panic mid-run) is stopped and
+    /// joined too, so its thread, pipe and buffer never outlive the run.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
@@ -114,7 +126,15 @@ pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
     });
 
     let timeout = Duration::from_secs(job.timeout_seconds.max(1) as u64);
-    let wait_result = child.wait_timeout(timeout)?;
+    let wait_result = match child.wait_timeout(timeout) {
+        Ok(result) => result,
+        Err(err) => {
+            // Don't leave the job running unwatched; the readers stop when dropped.
+            kill_process_tree(&mut child);
+            let _ = child.wait();
+            return Err(err.into());
+        }
+    };
 
     let timed_out = wait_result.is_none();
     if timed_out {
@@ -260,14 +280,14 @@ fn spawn_reader<R: PollRead + Send + 'static>(
         captured,
         cancel,
         done,
-        handle,
+        handle: Some(handle),
     }
 }
 
 /// What a reader captured. Waits until `deadline` for EOF; past that, stops the reader,
 /// closes the stream and keeps what was read so far. The reader thread is always joined.
 fn collect(reader: Option<Reader>, deadline: Instant, errors: &mut Vec<String>) -> Captured {
-    let Some(reader) = reader else {
+    let Some(mut reader) = reader else {
         return Captured::default();
     };
     let wait = deadline.saturating_duration_since(Instant::now());
@@ -281,7 +301,9 @@ fn collect(reader: Option<Reader>, deadline: Instant, errors: &mut Vec<String>) 
         ));
     }
     // Returns within one POLL_INTERVAL of cancel.
-    let _ = reader.handle.join();
+    if let Some(handle) = reader.handle.take() {
+        let _ = handle.join();
+    }
     let mut captured = reader.captured.lock().unwrap_or_else(|e| e.into_inner());
     let taken = std::mem::take(&mut *captured);
     if let Some(err) = &taken.error {
@@ -530,6 +552,24 @@ mod tests {
         assert!(errors[0].contains("still open"));
         // Our end is closed, so the holder's next write fails instead of filling a pipe
         // nobody reads.
+        assert!(writer.write_all(b"after").is_err());
+    }
+
+    #[test]
+    fn a_reader_dropped_without_collect_is_stopped_and_its_pipe_closed() {
+        use std::io::Write;
+        let (pipe_reader, mut writer) = std::io::pipe().expect("pipe");
+        let reader = spawn_reader(pipe_reader, 1024, "stdout");
+        writer.write_all(b"partial").expect("write");
+
+        // As when the run errors or unwinds before collecting.
+        let started = Instant::now();
+        drop(reader);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "reader was joined promptly"
+        );
         assert!(writer.write_all(b"after").is_err());
     }
 }
