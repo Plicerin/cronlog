@@ -538,6 +538,32 @@ impl Database {
         Ok(())
     }
 
+    /// Enable a job and set its next run in one transaction, so the daemon never sees
+    /// it enabled with a stale timestamp. `next_for` gets the job's schedule and current
+    /// next run and returns the next run to store.
+    pub fn enable_job<F>(&self, name: &str, next_for: F) -> Result<NaiveDateTime>
+    where
+        F: FnOnce(&str, Option<NaiveDateTime>) -> Result<NaiveDateTime>,
+    {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (schedule, current_next) = tx
+            .query_row(
+                "SELECT schedule, next_run_at FROM jobs WHERE name = ?1 AND deleted_at IS NULL",
+                params![name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| CronlogError::NotFound(format!("job '{name}'")))?;
+        let next = next_for(&schedule, parse_dt_opt(current_next))?;
+        tx.execute(
+            "UPDATE jobs SET enabled = 1, next_run_at = ?1, updated_at = CURRENT_TIMESTAMP WHERE name = ?2 AND deleted_at IS NULL",
+            params![next.to_string(), name],
+        )?;
+        tx.commit()?;
+        Ok(next)
+    }
+
     pub fn set_next_run_at(&self, name: &str, next_run_at: NaiveDateTime) -> Result<()> {
         let conn = self.conn()?;
         let affected = conn.execute(

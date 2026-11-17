@@ -78,22 +78,19 @@ pub fn dispatch_due_jobs(
 
 /// Enable a job. If its next run passed while it was disabled, schedule the next future
 /// slot instead, so a `daily at 07:00` job enabled in the afternoon waits for tomorrow's
-/// 07:00 rather than firing at once. Returns the next run time.
+/// 07:00 rather than firing at once. Interval jobs keep their phase: an `every 10
+/// minutes` job whose 12:00 slot passed, enabled at 12:35, next runs at 12:40.
+/// Enabling and the new timestamp are written in one transaction. Returns the next run.
 pub fn enable_job(
     db: &Database,
     name: &str,
     now: chrono::NaiveDateTime,
 ) -> Result<chrono::NaiveDateTime> {
-    db.set_enabled(name, true)?;
-    let job = db.get_job_by_name(name)?;
-    match job.next_run_at {
+    db.enable_job(name, |schedule, current_next| match current_next {
         Some(next) if next > now => Ok(next),
-        _ => {
-            let next = schedule::parse_schedule(&job.schedule)?.next_after(now)?;
-            db.set_next_run_at(name, next)?;
-            Ok(next)
-        }
-    }
+        Some(previous) => first_slot_after(schedule, previous, now),
+        None => schedule::parse_schedule(schedule)?.next_after(now),
+    })
 }
 
 /// Mark runs abandoned by failed workers as `interrupted`. Any that the database still
@@ -240,8 +237,18 @@ fn next_run_after_scheduled_time(
     scheduled_for: chrono::NaiveDateTime,
     now: chrono::NaiveDateTime,
 ) -> Result<chrono::NaiveDateTime> {
-    let parsed = schedule::parse_schedule(&job.schedule)?;
-    let mut next = parsed.next_after(scheduled_for)?;
+    first_slot_after(&job.schedule, scheduled_for, now)
+}
+
+/// The first slot of `schedule` after `now`, stepping from `previous` so intervals
+/// keep their phase.
+fn first_slot_after(
+    schedule: &str,
+    previous: chrono::NaiveDateTime,
+    now: chrono::NaiveDateTime,
+) -> Result<chrono::NaiveDateTime> {
+    let parsed = schedule::parse_schedule(schedule)?;
+    let mut next = parsed.next_after(previous)?;
     while next <= now {
         next = parsed.next_after(next)?;
     }
@@ -452,6 +459,33 @@ mod tests {
             enable_job(&db, "digest", added).expect("enable"),
             at(7, 0, 0)
         );
+    }
+
+    #[test]
+    fn enabling_an_interval_job_keeps_its_phase() {
+        let db = test_db();
+        db.add_job(
+            "tick",
+            &quick_command(),
+            "every 10 minutes",
+            60,
+            None,
+            at(12, 0, 0),
+        )
+        .expect("add");
+        db.set_enabled("tick", false).expect("disable");
+
+        // The 12:00 slot passed; enabled at 12:35 the next slot is 12:40, not 12:45.
+        let next = enable_job(&db, "tick", at(12, 35, 0)).expect("enable");
+        assert_eq!(next, at(12, 40, 0));
+        assert!(db.get_due_jobs(at(12, 35, 0)).expect("due").is_empty());
+        assert_eq!(db.get_due_jobs(at(12, 40, 0)).expect("due").len(), 1);
+    }
+
+    #[test]
+    fn enabling_a_missing_job_is_not_found() {
+        let db = test_db();
+        assert!(enable_job(&db, "nope", at(12, 0, 0)).is_err());
     }
 
     #[test]
