@@ -63,7 +63,10 @@ cronlog add --name pilot --schedule "every 1 hours" --max-runs 12 -- ./pipeline.
 - Timeout: 1 hour
 - Stdout limit: 256 KB
 - Stderr limit: 256 KB
-- Overlap behavior: forbid overlapping runs; skipped runs are recorded
+- Concurrency: due jobs run in parallel, each on its own thread, so a long job never delays another job
+- Overlap behavior: forbid overlapping runs of the same job; skipped runs are recorded
+- Output: stdout/stderr are read while the job runs, so large output never blocks it; output a background process keeps open is captured for 5 more seconds after the job exits
+- Timeouts: kill the job's whole process tree (its process group on Unix, `taskkill /T` on Windows), not only the direct child. Because each job leads its own process group, Ctrl+C on a foreground daemon does not stop running jobs; under systemd, stopping the service stops them
 - Missed runs: run once, then compute the next future run
 - Daemon restart recovery: stale `running` runs are marked `interrupted` with a stderr log, then due jobs can run again normally
 - Bounded runs: optional `--max-runs N`; scheduled runs that actually start count, manual runs and overlap skips do not
