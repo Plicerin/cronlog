@@ -30,6 +30,7 @@ cargo run -- run heartbeat --now
 cargo run -- disable heartbeat
 cargo run -- enable heartbeat
 cargo run -- remove heartbeat
+cargo run -- prune --older-than 30d --dry-run
 ```
 
 Inspection commands also support `--json` for scripts:
@@ -72,6 +73,17 @@ cronlog add --name pilot --schedule "every 1 hours" --max-runs 12 -- ./pipeline.
 - Daemon restart recovery: stale `running` runs are marked `interrupted` with a stderr log, then due jobs can run again normally
 - Worker failure recovery: if a run's worker cannot record its result (a database error or a panic), the daemon marks that run `interrupted` on the next tick, retrying until the database accepts it, so the job's later slots are not skipped
 - Bounded runs: optional `--max-runs N`; scheduled runs that actually start count, manual runs and overlap skips do not
+- History retention: the daemon deletes runs (and their logs) that finished more than 30 days ago, once a day, in batches of 500 so jobs never wait long to record results. It always keeps each job's newest 20 runs, every `running` run, and, for a job with `--max-runs`, the runs that count toward its limit. Change it with `daemon --retain 90d --keep-last 50`, or keep everything with `--retain forever`
+- Database size: new databases use SQLite's incremental auto-vacuum, so pruning shrinks the file. A database created by an older Cronlog reuses the freed space but does not shrink until you run `cronlog prune --vacuum` once (it rewrites the file and locks it while it runs; stop the daemon first if the file is large)
+
+## Pruning by hand
+
+```bash
+cronlog prune --older-than 30d --dry-run   # count what would go
+cronlog prune --older-than 30d             # delete it
+cronlog prune --older-than 30d --vacuum    # delete, then compact the file
+cronlog --json prune --older-than 7d --keep-last 5
+```
 
 ## Build
 

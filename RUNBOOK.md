@@ -314,6 +314,15 @@ Remove future scheduling while keeping run history:
 cronlog --db "$CRONLOG_DB" remove content-pipeline
 ```
 
+Run history is kept for 30 days by default (at least the newest 20 runs per job); the daemon prunes once a day. Set it on the daemon's command line, for example `daemon --retain 90d --keep-last 50`, or `--retain forever`. To prune by hand, or to compact a database created before retention existed:
+
+```bash
+cronlog --db "$CRONLOG_DB" prune --older-than 30d --dry-run
+sudo systemctl stop cronlog          # --vacuum locks the database while it rewrites it
+cronlog --db "$CRONLOG_DB" prune --older-than 30d --vacuum
+sudo systemctl start cronlog
+```
+
 ## 10. Monitoring Checks
 
 Basic systemd health:

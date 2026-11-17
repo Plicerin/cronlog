@@ -82,6 +82,27 @@ pub struct StatusRow {
     pub last_error: Option<String>,
 }
 
+/// What one prune pass removed.
+#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct PruneReport {
+    pub runs: usize,
+    pub logs: usize,
+}
+
+/// Runs old enough to delete: finished before ?2 and not among their job's newest ?1 runs.
+/// Never a `running` run. For a live job with `--max-runs`, never the scheduled runs that
+/// count toward its limit, since the limit is enforced by counting those rows.
+const PRUNABLE_RUNS: &str = "SELECT r.id FROM (
+        SELECT id, job_id, status, trigger_type,
+               COALESCE(finished_at, started_at, scheduled_for) AS ended,
+               ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY id DESC) AS newest
+        FROM runs
+    ) r
+    JOIN jobs j ON j.id = r.job_id
+    WHERE r.newest > ?1 AND r.ended < ?2 AND r.status <> 'running'
+      AND NOT (j.max_runs IS NOT NULL AND j.deleted_at IS NULL
+               AND r.trigger_type = 'schedule' AND r.status NOT IN ('running', 'skipped'))";
+
 /// A path, not a connection: every operation opens its own connection, so a clone can be
 /// handed to each job's thread.
 #[derive(Debug, Clone)]
@@ -109,6 +130,16 @@ impl Database {
 
     pub fn init(&self) -> Result<()> {
         let conn = self.conn()?;
+        let tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |r| r.get(0),
+        )?;
+        if tables == 0 {
+            // Only takes effect before the first table exists. Lets pruning hand freed
+            // pages back to the filesystem; older databases convert with `prune --vacuum`.
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+        }
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS jobs (
@@ -151,6 +182,7 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(enabled, next_run_at, deleted_at);
             CREATE INDEX IF NOT EXISTS idx_runs_job_started ON runs(job_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
             "#,
         )?;
         if !jobs_has_column(&conn, "max_runs")? {
@@ -526,6 +558,77 @@ impl Database {
         Ok(())
     }
 
+    /// Delete up to `batch` prunable runs (see PRUNABLE_RUNS) and their logs, in one short
+    /// transaction so the daemon's own writes wait at most one batch. Returns what was
+    /// removed; fewer than `batch` runs means nothing prunable is left.
+    pub fn prune_batch(
+        &self,
+        cutoff: NaiveDateTime,
+        keep_last: i64,
+        batch: i64,
+    ) -> Result<PruneReport> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut report = PruneReport::default();
+        {
+            let mut select = tx.prepare(&format!("{PRUNABLE_RUNS} ORDER BY r.id LIMIT ?3"))?;
+            let ids = select
+                .query_map(params![keep_last, cutoff.to_string(), batch], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut delete_logs = tx.prepare("DELETE FROM logs WHERE run_id = ?1")?;
+            let mut delete_run = tx.prepare("DELETE FROM runs WHERE id = ?1")?;
+            for id in ids {
+                report.logs += delete_logs.execute([id])?;
+                report.runs += delete_run.execute([id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// How many runs `prune_batch` would delete in total, without deleting any.
+    pub fn count_prunable(&self, cutoff: NaiveDateTime, keep_last: i64) -> Result<i64> {
+        let conn = self.conn()?;
+        Ok(conn.query_row(
+            &format!("SELECT COUNT(*) FROM ({PRUNABLE_RUNS})"),
+            params![keep_last, cutoff.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Give pages freed by pruning back to the filesystem. `full` rewrites the whole file
+    /// (VACUUM) and switches it to incremental auto-vacuum, which takes an exclusive lock
+    /// for as long as the rewrite runs; otherwise only an incremental-vacuum database is
+    /// trimmed. Without either, SQLite still reuses freed pages, so the file stops growing.
+    pub fn reclaim_space(&self, full: bool) -> Result<()> {
+        let conn = self.conn()?;
+        if full {
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+        } else if auto_vacuum_mode(&conn)? == 2 {
+            // Frees one page per step, so step it to the end; a single step (as
+            // execute_batch does) hands back one page and leaves the rest.
+            let mut stmt = conn.prepare("PRAGMA incremental_vacuum")?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+        }
+        Ok(())
+    }
+
+    /// The database file's size in bytes, as SQLite counts its pages.
+    pub fn size_bytes(&self) -> Result<i64> {
+        let conn = self.conn()?;
+        let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        Ok(pages * page_size)
+    }
+
+    #[cfg(test)]
+    pub fn auto_vacuum(&self) -> Result<i64> {
+        auto_vacuum_mode(&self.conn()?)
+    }
+
     pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
         let conn = self.conn()?;
         let affected = conn.execute(
@@ -666,6 +769,11 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         max_runs: row.get(6)?,
         next_run_at: parse_dt_opt(next),
     })
+}
+
+/// 0 = none, 1 = full, 2 = incremental.
+fn auto_vacuum_mode(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?)
 }
 
 fn remaining_runs(max_runs: Option<i64>, scheduled_runs: i64) -> Option<i64> {

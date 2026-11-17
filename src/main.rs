@@ -64,11 +64,69 @@ fn main() -> Result<()> {
                 ui::print_status(&rows);
             }
         }
-        Commands::Daemon { poll_seconds } => {
+        Commands::Daemon {
+            poll_seconds,
+            retain,
+            keep_last,
+        } => {
+            let retention = match retain {
+                cli::Retain::Forever => None,
+                cli::Retain::For(age) => Some(scheduler::Retention {
+                    max_age: to_chrono(age),
+                    keep_last,
+                }),
+            };
+            let kept = match retain {
+                cli::Retain::Forever => "keeping all history".to_string(),
+                cli::Retain::For(age) => format!(
+                    "keeping {} of history (at least {keep_last} runs per job)",
+                    humantime::format_duration(age)
+                ),
+            };
             println!(
-                "Cronlog daemon started. polling every {poll_seconds}s. press Ctrl+C to stop."
+                "Cronlog daemon started. polling every {poll_seconds}s, {kept}. press Ctrl+C to stop."
             );
-            scheduler::run_daemon(&db, poll_seconds)?;
+            scheduler::run_daemon(&db, poll_seconds, retention)?;
+        }
+        Commands::Prune {
+            older_than,
+            keep_last,
+            dry_run,
+            vacuum,
+        } => {
+            let retention = scheduler::Retention {
+                max_age: to_chrono(older_than),
+                keep_last,
+            };
+            let now = chrono::Local::now().naive_local();
+            let age = humantime::format_duration(older_than);
+            if dry_run {
+                let count = db.count_prunable(retention.cutoff(now), keep_last)?;
+                println!(
+                    "Would delete {count} runs finished more than {age} ago (keeping each job's newest {keep_last})"
+                );
+            } else {
+                let before = db.size_bytes()?;
+                let report = scheduler::prune_history(&db, retention, now)?;
+                db.reclaim_space(vacuum)?;
+                let after = db.size_bytes()?;
+                if json {
+                    ui::print_json(&serde_json::json!({
+                        "runs": report.runs,
+                        "logs": report.logs,
+                        "size_before": before,
+                        "size_after": after,
+                    }))?;
+                } else {
+                    println!(
+                        "Deleted {} runs and {} log rows finished more than {age} ago (kept each job's newest {keep_last}). Database {} -> {} KB",
+                        report.runs,
+                        report.logs,
+                        before / 1024,
+                        after / 1024
+                    );
+                }
+            }
         }
         Commands::History { name, limit } => {
             let rows = db.history(&name, limit)?;
@@ -114,4 +172,9 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// A std duration as chrono's; one too long for chrono keeps everything.
+fn to_chrono(duration: std::time::Duration) -> chrono::Duration {
+    chrono::Duration::from_std(duration).unwrap_or(chrono::Duration::MAX)
 }

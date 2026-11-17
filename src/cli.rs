@@ -15,6 +15,50 @@ fn parse_positive_i64(input: &str) -> std::result::Result<i64, String> {
     Ok(value)
 }
 
+/// How long run history is kept: a duration such as 30d or 12h, or `forever`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retain {
+    Forever,
+    For(Duration),
+}
+
+fn parse_retain(input: &str) -> std::result::Result<Retain, String> {
+    match input.trim().to_lowercase().as_str() {
+        "forever" | "off" | "never" => Ok(Retain::Forever),
+        other => {
+            let duration = humantime::parse_duration(other).map_err(|e| e.to_string())?;
+            if duration.is_zero() {
+                return Err("retention must be longer than zero, or `forever`".into());
+            }
+            Ok(Retain::For(duration))
+        }
+    }
+}
+
+fn parse_age(input: &str) -> std::result::Result<Duration, String> {
+    match parse_retain(input)? {
+        Retain::For(duration) => Ok(duration),
+        Retain::Forever => Err("expected a duration such as 30d".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retain_takes_a_duration_or_forever() {
+        assert_eq!(
+            parse_retain("30d"),
+            Ok(Retain::For(Duration::from_secs(30 * 86_400)))
+        );
+        assert_eq!(parse_retain("Forever"), Ok(Retain::Forever));
+        assert!(parse_retain("0s").is_err());
+        assert!(parse_retain("soon").is_err());
+        assert!(parse_age("forever").is_err());
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cronlog: cron with durable history and logs")]
 pub struct Cli {
@@ -69,6 +113,36 @@ pub enum Commands {
         /// Poll interval in seconds
         #[arg(long, default_value_t = 1)]
         poll_seconds: u64,
+
+        /// Delete runs that finished longer ago than this, checked daily: 30d, 12h, or
+        /// `forever` to keep everything
+        #[arg(long, default_value = "30d", value_parser = parse_retain)]
+        retain: Retain,
+
+        /// Always keep each job's newest N runs, however old
+        #[arg(long, default_value_t = 20, value_parser = parse_positive_i64)]
+        keep_last: i64,
+    },
+
+    /// Delete old run history now (the daemon also does this daily)
+    Prune {
+        /// Delete runs that finished longer ago than this, for example 30d or 12h
+        #[arg(long, default_value = "30d", value_parser = parse_age)]
+        older_than: Duration,
+
+        /// Always keep each job's newest N runs, however old
+        #[arg(long, default_value_t = 20, value_parser = parse_positive_i64)]
+        keep_last: i64,
+
+        /// Only count what would be deleted
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Afterwards, rewrite the file to its smallest size and switch it to incremental
+        /// auto-vacuum. Locks the database while it runs; stop the daemon first for a
+        /// large file
+        #[arg(long)]
+        vacuum: bool,
     },
 
     /// Show run history for a job
