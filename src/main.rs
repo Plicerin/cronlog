@@ -100,8 +100,8 @@ fn main() -> Result<()> {
             scheduler::run_job_once(&db, &job, chrono::Local::now().naive_local(), "manual")?;
         }
         Commands::Enable { name } => {
-            db.set_enabled(&name, true)?;
-            println!("Enabled job '{name}'");
+            let next = scheduler::enable_job(&db, &name, chrono::Local::now().naive_local())?;
+            println!("Enabled job '{name}', next run {next}");
         }
         Commands::Disable { name } => {
             db.set_enabled(&name, false)?;
