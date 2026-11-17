@@ -82,9 +82,16 @@ pub struct StatusRow {
     pub last_error: Option<String>,
 }
 
+/// A path, not a connection: every operation opens its own connection, so a clone can be
+/// handed to each job's thread.
+#[derive(Debug, Clone)]
 pub struct Database {
     path: String,
 }
+
+/// Jobs now finish concurrently and each records its result; wait for a lock instead of
+/// failing with SQLITE_BUSY.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -95,6 +102,7 @@ impl Database {
 
     fn conn(&self) -> Result<Connection> {
         let conn = Connection::open(&self.path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(conn)
     }

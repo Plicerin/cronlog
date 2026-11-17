@@ -9,29 +9,46 @@ pub fn run_daemon(db: &Database, poll_seconds: u64) -> Result<()> {
     recover_interrupted_runs(db)?;
 
     loop {
-        let now = Local::now().naive_local();
-        let due_jobs = db.get_due_jobs(now)?;
-
-        for job in due_jobs {
-            let scheduled_for = job.next_run_at.unwrap_or(now);
-            let next_run_at = next_run_after_scheduled_time(&job, scheduled_for, now)?;
-
-            match db.claim_scheduled_run(job.id, scheduled_for, next_run_at, runner::now())? {
-                RunClaim::Claimed(run_id) => {
-                    run_claimed_job(db, &job, run_id, scheduled_for, "schedule")?;
-                }
-                RunClaim::Skipped(_) => {
-                    println!(
-                        "Skipped '{}' because a previous run is still active",
-                        job.name
-                    );
-                }
-                RunClaim::NotDue => {}
-            }
-        }
-
+        // Handles are dropped: runs finish on their own threads and record their own results.
+        dispatch_due_jobs(db, Local::now().naive_local())?;
         thread::sleep(Duration::from_secs(poll_seconds.max(1)));
     }
+}
+
+/// Claim every due job and start each claimed run on its own thread.
+///
+/// Runs used to execute inline, one at a time: a 20-minute job held every other job until
+/// it finished, and their slots passed unrecorded. Overlap protection is unchanged: the
+/// claim transaction records a `skipped` run while the same job is still running.
+pub fn dispatch_due_jobs(
+    db: &Database,
+    now: chrono::NaiveDateTime,
+) -> Result<Vec<thread::JoinHandle<()>>> {
+    let mut handles = Vec::new();
+    for job in db.get_due_jobs(now)? {
+        let scheduled_for = job.next_run_at.unwrap_or(now);
+        let next_run_at = next_run_after_scheduled_time(&job, scheduled_for, now)?;
+
+        match db.claim_scheduled_run(job.id, scheduled_for, next_run_at, runner::now())? {
+            RunClaim::Claimed(run_id) => {
+                let db = db.clone();
+                handles.push(thread::spawn(move || {
+                    if let Err(err) = run_claimed_job(&db, &job, run_id, scheduled_for, "schedule")
+                    {
+                        eprintln!("Could not record job '{}' run #{}: {err}", job.name, run_id);
+                    }
+                }));
+            }
+            RunClaim::Skipped(_) => {
+                println!(
+                    "Skipped '{}' because a previous run is still active",
+                    job.name
+                );
+            }
+            RunClaim::NotDue => {}
+        }
+    }
+    Ok(handles)
 }
 
 fn recover_interrupted_runs(db: &Database) -> Result<()> {
@@ -216,5 +233,83 @@ mod tests {
         .expect("next run");
 
         assert_eq!(next, at(12, 40, 0));
+    }
+
+    fn test_db() -> Database {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("Cronlog-sched-test-{unique}.db"));
+        let db = Database::open(&path).expect("open test db");
+        db.init().expect("init test db");
+        db
+    }
+
+    #[cfg(unix)]
+    fn slow_command() -> Vec<String> {
+        vec!["sleep".into(), "3".into()]
+    }
+
+    #[cfg(windows)]
+    fn slow_command() -> Vec<String> {
+        vec!["ping".into(), "-n".into(), "4".into(), "127.0.0.1".into()]
+    }
+
+    #[cfg(unix)]
+    fn quick_command() -> Vec<String> {
+        vec!["true".into()]
+    }
+
+    #[cfg(windows)]
+    fn quick_command() -> Vec<String> {
+        vec!["cmd".into(), "/C".into(), "exit 0".into()]
+    }
+
+    fn last_status(db: &Database, name: &str) -> String {
+        db.history(name, 1).expect("history")[0].status.clone()
+    }
+
+    #[test]
+    fn a_slow_job_does_not_delay_other_jobs() {
+        let db = test_db();
+        let now = Local::now().naive_local();
+        db.add_job("slow", &slow_command(), "every 1 hours", 60, None, now)
+            .expect("add slow");
+        db.add_job("quick", &quick_command(), "every 1 hours", 60, None, now)
+            .expect("add quick");
+
+        let handles = dispatch_due_jobs(&db, now).expect("dispatch");
+        assert_eq!(handles.len(), 2);
+        thread::sleep(Duration::from_millis(1500));
+        assert_eq!(last_status(&db, "quick"), "success");
+        assert_eq!(last_status(&db, "slow"), "running");
+
+        for handle in handles {
+            handle.join().expect("run thread");
+        }
+        assert_eq!(last_status(&db, "slow"), "success");
+    }
+
+    #[test]
+    fn a_job_still_running_at_its_next_slot_is_recorded_as_skipped() {
+        let db = test_db();
+        let now = Local::now().naive_local();
+        db.add_job("slow", &slow_command(), "every 1 seconds", 60, None, now)
+            .expect("add slow");
+
+        let first = dispatch_due_jobs(&db, now).expect("first dispatch");
+        thread::sleep(Duration::from_millis(300));
+        let second =
+            dispatch_due_jobs(&db, now + chrono::Duration::seconds(1)).expect("second dispatch");
+        assert!(
+            second.is_empty(),
+            "the overlapping slot must not start a run"
+        );
+        assert_eq!(last_status(&db, "slow"), "skipped");
+
+        for handle in first {
+            handle.join().expect("run thread");
+        }
     }
 }
