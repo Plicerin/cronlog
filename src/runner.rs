@@ -552,7 +552,7 @@ mod tests {
         assert!(errors[0].contains("still open"));
         // Our end is closed, so the holder's next write fails instead of filling a pipe
         // nobody reads.
-        assert!(writer.write_all(b"after").is_err());
+        assert!(pipe_closes(&mut writer));
     }
 
     #[test]
@@ -570,6 +570,20 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "reader was joined promptly"
         );
-        assert!(writer.write_all(b"after").is_err());
+        assert!(pipe_closes(&mut writer));
+    }
+
+    /// Whether writes to `writer` start failing, i.e. nothing holds the read end any more.
+    /// Allows a moment: a child another test is spawning in parallel holds a copy of every
+    /// descriptor between its fork and exec.
+    fn pipe_closes(writer: &mut std::io::PipeWriter) -> bool {
+        use std::io::Write;
+        (0..50).any(|_| {
+            if writer.write_all(b"after").is_err() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+            false
+        })
     }
 }

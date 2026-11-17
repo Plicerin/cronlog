@@ -82,6 +82,74 @@ pub struct StatusRow {
     pub last_error: Option<String>,
 }
 
+/// A finished run's outcome and captured output, recorded together.
+#[derive(Debug)]
+pub struct RunResult<'a> {
+    pub status: &'a str,
+    pub finished_at: NaiveDateTime,
+    pub duration_ms: i64,
+    pub exit_code: Option<i64>,
+    pub error: Option<&'a str>,
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+/// What one prune pass removed.
+#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct PruneReport {
+    pub runs: usize,
+    pub logs: usize,
+}
+
+/// One job's runs old enough to delete: job ?1, scheduled before the cutoff ?2, and older
+/// than the job's keep-last boundary run (?3 scheduled_for, ?4 id). Never a `running` run.
+///
+/// Age is `scheduled_for`, the one timestamp every run has (an overlap skip has no
+/// `started_at`). Each query is a range scan on an index whose rows are nearly all
+/// deletable, so the rows examined stay close to the rows deleted: at most keep-last plus
+/// any `running` runs are scanned and kept.
+const PRUNABLE_FOR_JOB: &str = "FROM runs INDEXED BY idx_runs_job_scheduled
+    WHERE job_id = ?1 AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
+      AND status <> 'running'";
+
+/// For a live job with `--max-runs`: its limit is enforced by counting its scheduled,
+/// started runs, so only its overlap skips and its manual runs may go. Separate indexed
+/// queries for each, so the kept counted runs are never scanned. INDEXED BY pins the
+/// index: left to itself SQLite picks idx_runs_job_scheduled and walks those runs.
+const PRUNABLE_SKIPS_FOR_BOUNDED_JOB: &str = "FROM runs INDEXED BY idx_runs_job_trigger_status
+    WHERE job_id = ?1 AND trigger_type = 'schedule' AND status = 'skipped'
+      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)";
+const PRUNABLE_MANUAL_FOR_BOUNDED_JOB: &str = "FROM runs INDEXED BY idx_runs_job_trigger_status
+    WHERE job_id = ?1 AND trigger_type = 'manual'
+      AND status IN ('success', 'failed', 'timed_out', 'interrupted', 'skipped')
+      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)";
+
+/// The prunable-run filters for one job.
+fn prunable_filters(protect_counted: bool) -> &'static [&'static str] {
+    if protect_counted {
+        &[
+            PRUNABLE_SKIPS_FOR_BOUNDED_JOB,
+            PRUNABLE_MANUAL_FOR_BOUNDED_JOB,
+        ]
+    } else {
+        &[PRUNABLE_FOR_JOB]
+    }
+}
+
+/// Pages handed back to the filesystem per step (about 4 MB at SQLite's default 4 KB page
+/// size). Each step is its own short write transaction.
+pub const RECLAIM_CHUNK_PAGES: i64 = 1000;
+
+/// A job with more than keep-last runs, and the newest run that pruning may not pass.
+struct PruneTarget {
+    job_id: i64,
+    boundary_scheduled_for: String,
+    boundary_id: i64,
+    protect_counted: bool,
+}
+
 /// A path, not a connection: every operation opens its own connection, so a clone can be
 /// handed to each job's thread.
 #[derive(Debug, Clone)]
@@ -109,6 +177,16 @@ impl Database {
 
     pub fn init(&self) -> Result<()> {
         let conn = self.conn()?;
+        let tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |r| r.get(0),
+        )?;
+        if tables == 0 {
+            // Only takes effect before the first table exists. Lets pruning hand freed
+            // pages back to the filesystem; older databases convert with `prune --vacuum`.
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+        }
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS jobs (
@@ -151,6 +229,10 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(enabled, next_run_at, deleted_at);
             CREATE INDEX IF NOT EXISTS idx_runs_job_started ON runs(job_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
+            CREATE INDEX IF NOT EXISTS idx_runs_job_scheduled ON runs(job_id, scheduled_for);
+            CREATE INDEX IF NOT EXISTS idx_runs_job_trigger_status
+                ON runs(job_id, trigger_type, status, scheduled_for);
             "#,
         )?;
         if !jobs_has_column(&conn, "max_runs")? {
@@ -387,6 +469,41 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Record a run's outcome and its captured output in one transaction. The run stays
+    /// `running` until this commits, and pruning never touches a `running` run, so it can
+    /// never delete a run between its status and its logs.
+    pub fn record_result(&self, run_id: i64, result: &RunResult<'_>) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE runs SET status = ?1, finished_at = ?2, duration_ms = ?3, exit_code = ?4, error = ?5 WHERE id = ?6",
+            params![
+                result.status,
+                result.finished_at.to_string(),
+                result.duration_ms,
+                result.exit_code,
+                result.error,
+                run_id
+            ],
+        )?;
+        if updated == 0 {
+            return Err(CronlogError::NotFound(format!("run {run_id}")));
+        }
+        tx.execute(
+            "INSERT INTO logs (run_id, stdout, stderr, stdout_truncated, stderr_truncated) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                run_id,
+                result.stdout,
+                result.stderr,
+                result.stdout_truncated as i64,
+                result.stderr_truncated as i64
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn finish_run(
         &self,
         run_id: i64,
@@ -510,6 +627,7 @@ impl Database {
         Ok(Some((name, max_runs)))
     }
 
+    #[cfg(test)]
     pub fn insert_logs(
         &self,
         run_id: i64,
@@ -524,6 +642,121 @@ impl Database {
             params![run_id, stdout, stderr, stdout_truncated as i64, stderr_truncated as i64],
         )?;
         Ok(())
+    }
+
+    /// Delete up to `batch` prunable runs (see PRUNABLE_FOR_JOB) and their logs, in one
+    /// short transaction so the daemon's own writes wait at most one batch. The work is a
+    /// few index lookups per job plus the rows deleted, however long the history. Returns
+    /// what was removed; fewer than `batch` runs means nothing prunable is left.
+    pub fn prune_batch(
+        &self,
+        cutoff: NaiveDateTime,
+        keep_last: i64,
+        batch: i64,
+    ) -> Result<PruneReport> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cutoff = cutoff.to_string();
+        let mut report = PruneReport::default();
+        {
+            let mut delete_logs = tx.prepare("DELETE FROM logs WHERE run_id = ?1")?;
+            let mut delete_run = tx.prepare("DELETE FROM runs WHERE id = ?1")?;
+            'jobs: for target in prune_targets(&tx, keep_last)? {
+                for filter in prunable_filters(target.protect_counted) {
+                    let room = batch - report.runs as i64;
+                    if room <= 0 {
+                        break 'jobs;
+                    }
+                    let ids = tx
+                        .prepare_cached(&format!("SELECT id {filter} LIMIT ?5"))?
+                        .query_map(
+                            params![
+                                target.job_id,
+                                cutoff,
+                                target.boundary_scheduled_for,
+                                target.boundary_id,
+                                room
+                            ],
+                            |row| row.get::<_, i64>(0),
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for id in ids {
+                        report.logs += delete_logs.execute([id])?;
+                        report.runs += delete_run.execute([id])?;
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// How many runs `prune_batch` would delete in total, without deleting any.
+    pub fn count_prunable(&self, cutoff: NaiveDateTime, keep_last: i64) -> Result<i64> {
+        let conn = self.conn()?;
+        let cutoff = cutoff.to_string();
+        let mut total = 0;
+        for target in prune_targets(&conn, keep_last)? {
+            for filter in prunable_filters(target.protect_counted) {
+                total += conn
+                    .prepare_cached(&format!("SELECT COUNT(*) {filter}"))?
+                    .query_row(
+                        params![
+                            target.job_id,
+                            cutoff,
+                            target.boundary_scheduled_for,
+                            target.boundary_id
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Hand up to `max_pages` freed pages back to the filesystem, in one short statement.
+    /// Returns how many free pages remain. A no-op (returning 0) unless the database uses
+    /// incremental auto-vacuum.
+    pub fn reclaim_some(&self, max_pages: i64) -> Result<i64> {
+        let conn = self.conn()?;
+        if auto_vacuum_mode(&conn)? != 2 {
+            return Ok(0);
+        }
+        {
+            // Frees one page per step, so step it to the end; a single step (as
+            // execute_batch does) hands back one page.
+            let mut stmt = conn.prepare(&format!("PRAGMA incremental_vacuum({max_pages})"))?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+        }
+        Ok(conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?)
+    }
+
+    /// Give all pages freed by pruning back to the filesystem, chunk by chunk so other
+    /// writers get the lock in between. `full` instead rewrites the whole file (VACUUM)
+    /// and switches it to incremental auto-vacuum, holding an exclusive lock for the whole
+    /// rewrite. Without either, SQLite still reuses freed pages, so the file stops growing.
+    pub fn reclaim_space(&self, full: bool) -> Result<()> {
+        if full {
+            self.conn()?
+                .execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
+            return Ok(());
+        }
+        while self.reclaim_some(RECLAIM_CHUNK_PAGES)? > 0 {}
+        Ok(())
+    }
+
+    /// The database file's size in bytes, as SQLite counts its pages.
+    pub fn size_bytes(&self) -> Result<i64> {
+        let conn = self.conn()?;
+        let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        Ok(pages * page_size)
+    }
+
+    #[cfg(test)]
+    pub fn auto_vacuum(&self) -> Result<i64> {
+        auto_vacuum_mode(&self.conn()?)
     }
 
     pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
@@ -668,6 +901,44 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     })
 }
 
+/// Every job with more than `keep_last` runs, with the newest run pruning may not pass
+/// (its `keep_last`-th newest). Reads each boundary from idx_runs_job_scheduled.
+fn prune_targets(conn: &Connection, keep_last: i64) -> Result<Vec<PruneTarget>> {
+    let jobs = conn
+        .prepare("SELECT id, max_runs IS NOT NULL AND deleted_at IS NULL FROM jobs ORDER BY id")?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut boundary = conn.prepare(
+        "SELECT scheduled_for, id FROM runs
+         WHERE job_id = ?1 AND scheduled_for IS NOT NULL
+         ORDER BY scheduled_for DESC, id DESC LIMIT 1 OFFSET ?2",
+    )?;
+    let mut targets = Vec::new();
+    for (job_id, protect_counted) in jobs {
+        let found = boundary
+            .query_row(params![job_id, keep_last - 1], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .optional()?;
+        if let Some((boundary_scheduled_for, boundary_id)) = found {
+            targets.push(PruneTarget {
+                job_id,
+                boundary_scheduled_for,
+                boundary_id,
+                protect_counted,
+            });
+        }
+    }
+    Ok(targets)
+}
+
+/// 0 = none, 1 = full, 2 = incremental.
+fn auto_vacuum_mode(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?)
+}
+
 fn remaining_runs(max_runs: Option<i64>, scheduled_runs: i64) -> Option<i64> {
     max_runs.map(|max| (max - scheduled_runs).max(0))
 }
@@ -714,6 +985,56 @@ mod tests {
             .expect("valid date")
             .and_hms_opt(12, 0, 0)
             .expect("valid time")
+    }
+
+    /// SQLite's plan for `sql`, one line per step.
+    fn query_plan(db: &Database, sql: &str, params: impl rusqlite::Params) -> String {
+        let conn = db.conn().expect("conn");
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("explain");
+        let rows = stmt
+            .query_map(params, |row| row.get::<_, String>(3))
+            .expect("plan");
+        rows.map(|r| r.expect("row")).collect::<Vec<_>>().join("; ")
+    }
+
+    #[test]
+    fn pruning_reads_only_each_jobs_old_rows_through_an_index() {
+        let db = test_db();
+        let when = "2026-01-01 00:00:00";
+        for (filter, index) in [
+            (PRUNABLE_FOR_JOB, "idx_runs_job_scheduled"),
+            // A bounded job's kept counted runs must not be in the scanned range.
+            (
+                PRUNABLE_SKIPS_FOR_BOUNDED_JOB,
+                "idx_runs_job_trigger_status",
+            ),
+            (
+                PRUNABLE_MANUAL_FOR_BOUNDED_JOB,
+                "idx_runs_job_trigger_status",
+            ),
+        ] {
+            let select = query_plan(
+                &db,
+                &format!("SELECT id {filter} LIMIT ?5"),
+                params![1, when, when, 1, 500],
+            );
+            assert!(
+                select.contains(index) && select.contains("scheduled_for<?"),
+                "candidate scan is not a range on {index}: {select}"
+            );
+        }
+        let boundary = query_plan(
+            &db,
+            "SELECT scheduled_for, id FROM runs WHERE job_id = ?1 AND scheduled_for IS NOT NULL
+             ORDER BY scheduled_for DESC, id DESC LIMIT 1 OFFSET ?2",
+            params![1, 19],
+        );
+        assert!(
+            boundary.contains("idx_runs_job_scheduled") && !boundary.contains("TEMP B-TREE"),
+            "boundary lookup sorts instead of reading the index: {boundary}"
+        );
     }
 
     #[test]

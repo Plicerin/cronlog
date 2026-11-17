@@ -1,11 +1,11 @@
-use crate::db::{Database, HistoryRow, Job, RunClaim};
+use crate::db::{Database, HistoryRow, Job, PruneReport, RunClaim, RunResult, RECLAIM_CHUNK_PAGES};
 use crate::error::Result;
 use crate::{runner, schedule};
 use chrono::Local;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Claimed runs whose worker failed before recording a result, with the reason. The daemon
 /// marks them `interrupted`, retrying each tick until the database accepts it.
@@ -14,14 +14,130 @@ use std::time::Duration;
 /// `skipped` until the daemon restarted (stale-run recovery only runs at startup).
 pub type Orphans = Arc<Mutex<Vec<(i64, String)>>>;
 
-pub fn run_daemon(db: &Database, poll_seconds: u64) -> Result<()> {
+/// How much run history to keep: runs scheduled more than `max_age` ago are deleted,
+/// except each job's newest `keep_last` runs.
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    pub max_age: chrono::Duration,
+    pub keep_last: i64,
+}
+
+impl Retention {
+    pub fn cutoff(&self, now: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+        // A retention longer than the calendar allows keeps everything.
+        now.checked_sub_signed(self.max_age)
+            .unwrap_or(chrono::NaiveDateTime::MIN)
+    }
+}
+
+/// Runs deleted per transaction. Small enough that a job recording its result never
+/// waits long for the write lock.
+pub const PRUNE_BATCH: i64 = 500;
+/// How often the daemon prunes once it has caught up.
+const PRUNE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// After a failed prune, try again this much later rather than every tick.
+const PRUNE_RETRY: Duration = Duration::from_secs(60 * 60);
+
+/// Delete all history `retention` allows, batch by batch. Returns the totals.
+pub fn prune_history(
+    db: &Database,
+    retention: Retention,
+    now: chrono::NaiveDateTime,
+) -> Result<PruneReport> {
+    let cutoff = retention.cutoff(now);
+    let mut total = PruneReport::default();
+    loop {
+        let batch = db.prune_batch(cutoff, retention.keep_last, PRUNE_BATCH)?;
+        total.runs += batch.runs;
+        total.logs += batch.logs;
+        if (batch.runs as i64) < PRUNE_BATCH {
+            return Ok(total);
+        }
+    }
+}
+
+/// The daemon's pruning. Every step is bounded, one per tick, so a large backlog never
+/// stalls dispatch or holds the write lock long: delete one batch per tick until caught
+/// up, then hand back one chunk of freed pages per tick, then wait PRUNE_EVERY.
+struct Pruner {
+    retention: Retention,
+    next: Instant,
+    pass: PruneReport,
+    reclaiming: bool,
+}
+
+impl Pruner {
+    fn new(retention: Retention) -> Self {
+        Self {
+            retention,
+            next: Instant::now(),
+            pass: PruneReport::default(),
+            reclaiming: false,
+        }
+    }
+
+    fn tick(&mut self, db: &Database, now: chrono::NaiveDateTime) {
+        if Instant::now() < self.next {
+            return;
+        }
+        if self.reclaiming {
+            match db.reclaim_some(RECLAIM_CHUNK_PAGES) {
+                Ok(0) => self.finish_pass(),
+                Ok(_) => {} // more pages to hand back; next tick
+                Err(err) => {
+                    eprintln!("Could not reclaim space after pruning: {err}");
+                    self.finish_pass();
+                }
+            }
+            return;
+        }
+        let cutoff = self.retention.cutoff(now);
+        match db.prune_batch(cutoff, self.retention.keep_last, PRUNE_BATCH) {
+            Ok(batch) => {
+                self.pass.runs += batch.runs;
+                self.pass.logs += batch.logs;
+                if (batch.runs as i64) == PRUNE_BATCH {
+                    return; // more to do; next tick
+                }
+                if self.pass.runs > 0 {
+                    println!(
+                        "Pruned {} runs scheduled before {cutoff} (kept each job's newest {})",
+                        self.pass.runs, self.retention.keep_last
+                    );
+                }
+                // Reclaim even when nothing was deleted this pass: pages freed before a
+                // restart or a failed reclaim would otherwise never be handed back. With
+                // no free pages this is one quick step.
+                self.reclaiming = true;
+            }
+            Err(err) => {
+                eprintln!("Could not prune run history: {err}; retrying in 1h");
+                self.pass = PruneReport::default();
+                self.next = Instant::now() + PRUNE_RETRY;
+            }
+        }
+    }
+
+    fn finish_pass(&mut self) {
+        self.pass = PruneReport::default();
+        self.reclaiming = false;
+        self.next = Instant::now() + PRUNE_EVERY;
+    }
+}
+
+pub fn run_daemon(db: &Database, poll_seconds: u64, retention: Option<Retention>) -> Result<()> {
     recover_interrupted_runs(db)?;
     let orphans = Orphans::default();
+    let mut pruner = retention.map(Pruner::new);
 
     loop {
         recover_orphaned_runs(db, &orphans);
+        let now = Local::now().naive_local();
         // Handles are dropped: runs finish on their own threads and record their own results.
-        dispatch_due_jobs(db, Local::now().naive_local(), &orphans)?;
+        dispatch_due_jobs(db, now, &orphans)?;
+        if let Some(pruner) = pruner.as_mut() {
+            pruner.tick(db, now);
+        }
         thread::sleep(Duration::from_secs(poll_seconds.max(1)));
     }
 }
@@ -193,20 +309,19 @@ fn execute_claimed_run(
 
     match runner::execute(job, &context) {
         Ok(out) => {
-            db.finish_run(
+            db.record_result(
                 run_id,
-                &out.status,
-                runner::now(),
-                out.duration_ms,
-                out.exit_code,
-                out.error.as_deref(),
-            )?;
-            db.insert_logs(
-                run_id,
-                &out.stdout,
-                &out.stderr,
-                out.stdout_truncated,
-                out.stderr_truncated,
+                &RunResult {
+                    status: &out.status,
+                    finished_at: runner::now(),
+                    duration_ms: out.duration_ms,
+                    exit_code: out.exit_code,
+                    error: out.error.as_deref(),
+                    stdout: &out.stdout,
+                    stderr: &out.stderr,
+                    stdout_truncated: out.stdout_truncated,
+                    stderr_truncated: out.stderr_truncated,
+                },
             )?;
             println!(
                 "Finished job '{}' run #{}: {}",
@@ -216,8 +331,20 @@ fn execute_claimed_run(
         }
         Err(err) => {
             let message = err.to_string();
-            db.finish_run(run_id, "failed", runner::now(), 0, None, Some(&message))?;
-            db.insert_logs(run_id, "", &message, false, false)?;
+            db.record_result(
+                run_id,
+                &RunResult {
+                    status: "failed",
+                    finished_at: runner::now(),
+                    duration_ms: 0,
+                    exit_code: None,
+                    error: Some(&message),
+                    stdout: "",
+                    stderr: &message,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+            )?;
             println!("Failed job '{}' run #{}: {}", job.name, run_id, message);
             disable_if_max_runs_reached(db, job.id)?;
         }
@@ -338,6 +465,284 @@ mod tests {
 
     fn last_status(db: &Database, name: &str) -> String {
         db.history(name, 1).expect("history")[0].status.clone()
+    }
+
+    /// A finished run with a logs row, as the daemon records one.
+    fn finished_run(
+        db: &Database,
+        job_id: i64,
+        status: &str,
+        trigger: &str,
+        when: chrono::NaiveDateTime,
+    ) -> i64 {
+        let id = db
+            .create_run(job_id, "running", when, Some(when), trigger)
+            .expect("create run");
+        db.finish_run(id, status, when, 0, Some(0), None)
+            .expect("finish run");
+        db.insert_logs(id, "out", "", false, false).expect("logs");
+        id
+    }
+
+    fn days_before(now: chrono::NaiveDateTime, days: i64) -> chrono::NaiveDateTime {
+        now - chrono::Duration::days(days)
+    }
+
+    #[test]
+    fn pruning_keeps_recent_runs_each_jobs_newest_and_running_runs() {
+        let db = test_db();
+        let now = at(12, 0, 0);
+        db.add_job("a", &quick_command(), "every 1 hours", 60, None, now)
+            .expect("add");
+        let job = db.get_job_by_name("a").expect("job");
+        for _ in 0..30 {
+            finished_run(&db, job.id, "success", "schedule", days_before(now, 10));
+        }
+        let old_running = db
+            .create_run(
+                job.id,
+                "running",
+                days_before(now, 10),
+                Some(days_before(now, 10)),
+                "schedule",
+            )
+            .expect("running run");
+        let recent = finished_run(&db, job.id, "success", "schedule", now);
+        finished_run(&db, job.id, "failed", "schedule", now);
+
+        // Keep 1 day and the newest 5: the 2 recent runs, the running one and 2 old ones.
+        let retention = Retention {
+            max_age: chrono::Duration::days(1),
+            keep_last: 5,
+        };
+        assert_eq!(
+            db.count_prunable(retention.cutoff(now), 5).expect("count"),
+            28
+        );
+
+        let pruned = prune_history(&db, retention, now).expect("prune");
+        assert_eq!(pruned, PruneReport { runs: 28, logs: 28 });
+
+        let left = db.history("a", 100).expect("history");
+        assert_eq!(left.len(), 5);
+        assert!(left
+            .iter()
+            .any(|r| r.run_id == old_running && r.status == "running"));
+        assert!(left.iter().any(|r| r.run_id == recent));
+        assert_eq!(
+            db.count_prunable(retention.cutoff(now), 5).expect("count"),
+            0
+        );
+    }
+
+    #[test]
+    fn pruning_goes_in_batches() {
+        let db = test_db();
+        let now = at(12, 0, 0);
+        db.add_job("a", &quick_command(), "every 1 hours", 60, None, now)
+            .expect("add");
+        let job = db.get_job_by_name("a").expect("job");
+        for _ in 0..25 {
+            finished_run(&db, job.id, "success", "schedule", days_before(now, 10));
+        }
+        let cutoff = days_before(now, 1);
+        let sizes: Vec<usize> = (0..4)
+            .map(|_| db.prune_batch(cutoff, 1, 10).expect("batch").runs)
+            .collect();
+        assert_eq!(sizes, vec![10, 10, 4, 0]);
+    }
+
+    #[test]
+    fn pruning_keeps_runs_counted_toward_max_runs() {
+        let db = test_db();
+        let now = at(12, 0, 0);
+        db.add_job(
+            "bounded",
+            &quick_command(),
+            "every 1 hours",
+            60,
+            Some(3),
+            now,
+        )
+        .expect("add");
+        let job = db.get_job_by_name("bounded").expect("job");
+        let old = days_before(now, 10);
+        let counted: Vec<i64> = (0..3)
+            .map(|_| finished_run(&db, job.id, "success", "schedule", old))
+            .collect();
+        for _ in 0..4 {
+            finished_run(&db, job.id, "skipped", "schedule", old);
+        }
+        for _ in 0..2 {
+            finished_run(&db, job.id, "success", "manual", old);
+        }
+        let remaining = |db: &Database| db.list_jobs().expect("list")[0].remaining_runs;
+        assert_eq!(remaining(&db), Some(0));
+
+        // The skipped and manual runs go (bar the newest); the 3 counted runs stay, so
+        // the job still has no runs left instead of 3 more.
+        let retention = Retention {
+            max_age: chrono::Duration::days(1),
+            keep_last: 1,
+        };
+        let pruned = prune_history(&db, retention, now).expect("prune");
+        assert_eq!(pruned.runs, 5);
+        let left: Vec<i64> = db
+            .history("bounded", 100)
+            .expect("history")
+            .iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert!(counted.iter().all(|id| left.contains(id)));
+        assert_eq!(remaining(&db), Some(0));
+    }
+
+    #[test]
+    fn a_retention_longer_than_the_calendar_keeps_everything() {
+        let db = test_db();
+        let now = at(12, 0, 0);
+        db.add_job("a", &quick_command(), "every 1 hours", 60, None, now)
+            .expect("add");
+        let job = db.get_job_by_name("a").expect("job");
+        finished_run(&db, job.id, "success", "schedule", days_before(now, 10));
+        finished_run(&db, job.id, "success", "schedule", days_before(now, 10));
+        let retention = Retention {
+            max_age: chrono::Duration::MAX,
+            keep_last: 1,
+        };
+        assert_eq!(prune_history(&db, retention, now).expect("prune").runs, 0);
+    }
+
+    #[test]
+    fn pruning_shrinks_a_new_database() {
+        let db = test_db();
+        let now = at(12, 0, 0);
+        db.add_job("big", &quick_command(), "every 1 hours", 60, None, now)
+            .expect("add");
+        let job = db.get_job_by_name("big").expect("job");
+        let output = "x".repeat(20_000);
+        for _ in 0..50 {
+            let id = db
+                .create_run(job.id, "running", days_before(now, 10), None, "schedule")
+                .expect("run");
+            db.finish_run(id, "success", days_before(now, 10), 0, Some(0), None)
+                .expect("finish");
+            db.insert_logs(id, &output, "", false, false).expect("logs");
+        }
+        let before = db.size_bytes().expect("size");
+        let retention = Retention {
+            max_age: chrono::Duration::days(1),
+            keep_last: 1,
+        };
+        assert_eq!(prune_history(&db, retention, now).expect("prune").runs, 49);
+        // A bounded step hands back only part of it...
+        let left = db.reclaim_some(10).expect("reclaim chunk");
+        assert!(left > 0, "a 10-page step should leave free pages");
+        // ...and the rest comes back chunk by chunk.
+        db.reclaim_space(false).expect("reclaim");
+        assert_eq!(db.reclaim_some(10).expect("reclaim chunk"), 0);
+        let after = db.size_bytes().expect("size");
+        assert!(
+            after < before / 4,
+            "expected most of {before} bytes back, still {after}"
+        );
+    }
+
+    #[test]
+    fn the_daemon_reclaims_pages_left_from_an_earlier_pass() {
+        let db = test_db();
+        let now = at(12, 0, 0);
+        db.add_job("big", &quick_command(), "every 1 hours", 60, None, now)
+            .expect("add");
+        let job = db.get_job_by_name("big").expect("job");
+        let output = "x".repeat(20_000);
+        for _ in 0..30 {
+            let id = db
+                .create_run(job.id, "running", days_before(now, 10), None, "schedule")
+                .expect("run");
+            db.finish_run(id, "success", days_before(now, 10), 0, Some(0), None)
+                .expect("finish");
+            db.insert_logs(id, &output, "", false, false).expect("logs");
+        }
+        let retention = Retention {
+            max_age: chrono::Duration::days(1),
+            keep_last: 1,
+        };
+        // Deleted, but the daemon stopped before handing the pages back.
+        prune_history(&db, retention, now).expect("prune");
+        let before = db.size_bytes().expect("size");
+
+        // A fresh daemon finds nothing to delete, and still reclaims the leftover pages.
+        let mut pruner = Pruner::new(retention);
+        for _ in 0..10 {
+            pruner.tick(&db, now);
+        }
+        assert!(!pruner.reclaiming, "pass should have finished");
+        assert!(
+            db.size_bytes().expect("size") < before / 4,
+            "leftover pages were not reclaimed"
+        );
+    }
+
+    #[test]
+    fn a_result_is_recorded_whole_or_not_at_all() {
+        let db = test_db();
+        let now = at(12, 0, 0);
+        db.add_job("a", &quick_command(), "every 1 hours", 60, None, now)
+            .expect("add");
+        let job = db.get_job_by_name("a").expect("job");
+        let id = db
+            .create_run(job.id, "running", now, Some(now), "schedule")
+            .expect("run");
+        let result = RunResult {
+            status: "success",
+            finished_at: now,
+            duration_ms: 5,
+            exit_code: Some(0),
+            error: None,
+            stdout: "hello",
+            stderr: "",
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        db.record_result(id, &result).expect("record");
+        assert_eq!(last_status(&db, "a"), "success");
+        assert_eq!(
+            db.logs_for_run(id).expect("logs").stdout.as_deref(),
+            Some("hello")
+        );
+
+        // A run that is gone (as if pruned) is an error, and no orphan log row is left.
+        assert!(db.record_result(id + 1000, &result).is_err());
+        assert!(db.logs_for_run(id + 1000).is_err());
+    }
+
+    #[test]
+    fn new_databases_trim_freed_space_and_vacuum_converts_old_ones() {
+        let db = test_db();
+        assert_eq!(
+            db.auto_vacuum().expect("mode"),
+            2,
+            "new database is incremental"
+        );
+        db.reclaim_space(false).expect("incremental vacuum");
+
+        // A database whose tables predate this release stays as it was until --vacuum.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("Cronlog-legacy-{unique}.db"));
+        rusqlite::Connection::open(&path)
+            .expect("open")
+            .execute_batch("CREATE TABLE legacy (x INTEGER);")
+            .expect("legacy table");
+        let legacy = Database::open(&path).expect("open");
+        legacy.init().expect("init");
+        assert_eq!(legacy.auto_vacuum().expect("mode"), 0);
+        legacy.reclaim_space(false).expect("no-op");
+        legacy.reclaim_space(true).expect("vacuum");
+        assert_eq!(legacy.auto_vacuum().expect("mode"), 2);
     }
 
     #[test]
