@@ -449,10 +449,18 @@ mod tests {
         assert!(db.get_due_jobs(afternoon).expect("due").is_empty());
 
         // Enabled before its slot: the slot is kept.
-        db.set_enabled("digest", false).expect("disable");
-        db.set_next_run_at("digest", at(7, 0, 0)).expect("reset");
+        db.add_job(
+            "early",
+            &quick_command(),
+            "daily at 07:00",
+            60,
+            None,
+            at(7, 0, 0),
+        )
+        .expect("add");
+        db.set_enabled("early", false).expect("disable");
         assert_eq!(
-            enable_job(&db, "digest", added).expect("enable"),
+            enable_job(&db, "early", added).expect("enable"),
             at(7, 0, 0)
         );
     }

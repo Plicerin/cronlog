@@ -570,18 +570,6 @@ impl Database {
         Ok(next)
     }
 
-    pub fn set_next_run_at(&self, name: &str, next_run_at: NaiveDateTime) -> Result<()> {
-        let conn = self.conn()?;
-        let affected = conn.execute(
-            "UPDATE jobs SET next_run_at = ?1, updated_at = CURRENT_TIMESTAMP WHERE name = ?2 AND deleted_at IS NULL",
-            params![next_run_at.to_string(), name],
-        )?;
-        if affected == 0 {
-            return Err(CronlogError::NotFound(format!("job '{name}'")));
-        }
-        Ok(())
-    }
-
     pub fn remove_job(&self, name: &str) -> Result<()> {
         let conn = self.conn()?;
         let affected = conn.execute(
