@@ -23,10 +23,12 @@ pub enum Retain {
 }
 
 fn parse_retain(input: &str) -> std::result::Result<Retain, String> {
-    match input.trim().to_lowercase().as_str() {
+    let trimmed = input.trim();
+    // Only the keywords ignore case: humantime reads `M` as months and `m` as minutes.
+    match trimmed.to_lowercase().as_str() {
         "forever" | "off" | "never" => Ok(Retain::Forever),
-        other => {
-            let duration = humantime::parse_duration(other).map_err(|e| e.to_string())?;
+        _ => {
+            let duration = humantime::parse_duration(trimmed).map_err(|e| e.to_string())?;
             if duration.is_zero() {
                 return Err("retention must be longer than zero, or `forever`".into());
             }
@@ -53,6 +55,12 @@ mod tests {
             Ok(Retain::For(Duration::from_secs(30 * 86_400)))
         );
         assert_eq!(parse_retain("Forever"), Ok(Retain::Forever));
+        // Months, not minutes.
+        assert_eq!(
+            parse_retain("1M"),
+            Ok(Retain::For(humantime::parse_duration("1month").unwrap()))
+        );
+        assert_eq!(parse_retain("1m"), Ok(Retain::For(Duration::from_secs(60))));
         assert!(parse_retain("0s").is_err());
         assert!(parse_retain("soon").is_err());
         assert!(parse_age("forever").is_err());
@@ -114,7 +122,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 1)]
         poll_seconds: u64,
 
-        /// Delete runs that finished longer ago than this, checked daily: 30d, 12h, or
+        /// Delete runs scheduled longer ago than this, checked daily: 30d, 12h, 1M, or
         /// `forever` to keep everything
         #[arg(long, default_value = "30d", value_parser = parse_retain)]
         retain: Retain,
@@ -126,7 +134,7 @@ pub enum Commands {
 
     /// Delete old run history now (the daemon also does this daily)
     Prune {
-        /// Delete runs that finished longer ago than this, for example 30d or 12h
+        /// Delete runs scheduled longer ago than this, for example 30d, 12h or 1M (month)
         #[arg(long, default_value = "30d", value_parser = parse_age)]
         older_than: Duration,
 

@@ -1,4 +1,4 @@
-use crate::db::{Database, HistoryRow, Job, PruneReport, RunClaim};
+use crate::db::{Database, HistoryRow, Job, PruneReport, RunClaim, RECLAIM_CHUNK_PAGES};
 use crate::error::Result;
 use crate::{runner, schedule};
 use chrono::Local;
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 /// `skipped` until the daemon restarted (stale-run recovery only runs at startup).
 pub type Orphans = Arc<Mutex<Vec<(i64, String)>>>;
 
-/// How much run history to keep: runs that finished more than `max_age` ago are deleted,
+/// How much run history to keep: runs scheduled more than `max_age` ago are deleted,
 /// except each job's newest `keep_last` runs.
 #[derive(Debug, Clone, Copy)]
 pub struct Retention {
@@ -56,12 +56,14 @@ pub fn prune_history(
     }
 }
 
-/// The daemon's pruning: one batch per tick until caught up, so a large backlog never
-/// stalls dispatch, then once every PRUNE_EVERY.
+/// The daemon's pruning. Every step is bounded, one per tick, so a large backlog never
+/// stalls dispatch or holds the write lock long: delete one batch per tick until caught
+/// up, then hand back one chunk of freed pages per tick, then wait PRUNE_EVERY.
 struct Pruner {
     retention: Retention,
     next: Instant,
     pass: PruneReport,
+    reclaiming: bool,
 }
 
 impl Pruner {
@@ -70,11 +72,23 @@ impl Pruner {
             retention,
             next: Instant::now(),
             pass: PruneReport::default(),
+            reclaiming: false,
         }
     }
 
     fn tick(&mut self, db: &Database, now: chrono::NaiveDateTime) {
         if Instant::now() < self.next {
+            return;
+        }
+        if self.reclaiming {
+            match db.reclaim_some(RECLAIM_CHUNK_PAGES) {
+                Ok(0) => self.finish_pass(),
+                Ok(_) => {} // more pages to hand back; next tick
+                Err(err) => {
+                    eprintln!("Could not reclaim space after pruning: {err}");
+                    self.finish_pass();
+                }
+            }
             return;
         }
         let cutoff = self.retention.cutoff(now);
@@ -85,23 +99,28 @@ impl Pruner {
                 if (batch.runs as i64) == PRUNE_BATCH {
                     return; // more to do; next tick
                 }
-                if self.pass.runs > 0 {
-                    println!(
-                        "Pruned {} runs finished before {cutoff} (kept each job's newest {})",
-                        self.pass.runs, self.retention.keep_last
-                    );
-                    if let Err(err) = db.reclaim_space(false) {
-                        eprintln!("Could not reclaim space after pruning: {err}");
-                    }
+                if self.pass.runs == 0 {
+                    self.finish_pass();
+                    return;
                 }
-                self.pass = PruneReport::default();
-                self.next = Instant::now() + PRUNE_EVERY;
+                println!(
+                    "Pruned {} runs scheduled before {cutoff} (kept each job's newest {})",
+                    self.pass.runs, self.retention.keep_last
+                );
+                self.reclaiming = true;
             }
             Err(err) => {
                 eprintln!("Could not prune run history: {err}; retrying in 1h");
+                self.pass = PruneReport::default();
                 self.next = Instant::now() + PRUNE_RETRY;
             }
         }
+    }
+
+    fn finish_pass(&mut self) {
+        self.pass = PruneReport::default();
+        self.reclaiming = false;
+        self.next = Instant::now() + PRUNE_EVERY;
     }
 }
 
@@ -604,7 +623,12 @@ mod tests {
             keep_last: 1,
         };
         assert_eq!(prune_history(&db, retention, now).expect("prune").runs, 49);
+        // A bounded step hands back only part of it...
+        let left = db.reclaim_some(10).expect("reclaim chunk");
+        assert!(left > 0, "a 10-page step should leave free pages");
+        // ...and the rest comes back chunk by chunk.
         db.reclaim_space(false).expect("reclaim");
+        assert_eq!(db.reclaim_some(10).expect("reclaim chunk"), 0);
         let after = db.size_bytes().expect("size");
         assert!(
             after < before / 4,

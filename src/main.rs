@@ -102,9 +102,16 @@ fn main() -> Result<()> {
             let age = humantime::format_duration(older_than);
             if dry_run {
                 let count = db.count_prunable(retention.cutoff(now), keep_last)?;
-                println!(
-                    "Would delete {count} runs finished more than {age} ago (keeping each job's newest {keep_last})"
-                );
+                if json {
+                    ui::print_json(&serde_json::json!({
+                        "dry_run": true,
+                        "runs": count,
+                    }))?;
+                } else {
+                    println!(
+                        "Would delete {count} runs scheduled more than {age} ago (keeping each job's newest {keep_last})"
+                    );
+                }
             } else {
                 let before = db.size_bytes()?;
                 let report = scheduler::prune_history(&db, retention, now)?;
@@ -119,7 +126,7 @@ fn main() -> Result<()> {
                     }))?;
                 } else {
                     println!(
-                        "Deleted {} runs and {} log rows finished more than {age} ago (kept each job's newest {keep_last}). Database {} -> {} KB",
+                        "Deleted {} runs and {} log rows scheduled more than {age} ago (kept each job's newest {keep_last}). Database {} -> {} KB",
                         report.runs,
                         report.logs,
                         before / 1024,
