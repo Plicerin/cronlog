@@ -65,10 +65,12 @@ cronlog add --name pilot --schedule "every 1 hours" --max-runs 12 -- ./pipeline.
 - Stderr limit: 256 KB
 - Concurrency: due jobs run in parallel, each on its own thread, so a long job never delays another job
 - Overlap behavior: forbid overlapping runs of the same job; skipped runs are recorded
-- Output: stdout/stderr are read while the job runs, so large output never blocks it; output a background process keeps open is captured for 5 more seconds after the job exits
+- Output: stdout/stderr are read while the job runs, so large output never blocks it. If a background process the job started keeps them open, Cronlog captures 5 more seconds after the job exits, then closes its end: that process's next write to stdout/stderr fails (on Unix it gets SIGPIPE). Redirect a long-lived background process's output to a file
+- Enabling a job whose next run passed while it was disabled schedules the next future slot instead of running it at once
 - Timeouts: kill the job's whole process tree (its process group on Unix, `taskkill /T` on Windows), not only the direct child. Because each job leads its own process group, Ctrl+C on a foreground daemon does not stop running jobs; under systemd, stopping the service stops them
 - Missed runs: run once, then compute the next future run
 - Daemon restart recovery: stale `running` runs are marked `interrupted` with a stderr log, then due jobs can run again normally
+- Worker failure recovery: if a run's worker cannot record its result (a database error or a panic), the daemon marks that run `interrupted` on the next tick, retrying until the database accepts it, so the job's later slots are not skipped
 - Bounded runs: optional `--max-runs N`; scheduled runs that actually start count, manual runs and overlap skips do not
 
 ## Build

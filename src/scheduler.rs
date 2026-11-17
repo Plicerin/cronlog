@@ -2,15 +2,26 @@ use crate::db::{Database, HistoryRow, Job, RunClaim};
 use crate::error::Result;
 use crate::{runner, schedule};
 use chrono::Local;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+/// Claimed runs whose worker failed before recording a result, with the reason. The daemon
+/// marks them `interrupted`, retrying each tick until the database accepts it.
+///
+/// Without this, a run left `running` by a failed worker made every later slot of that job
+/// `skipped` until the daemon restarted (stale-run recovery only runs at startup).
+pub type Orphans = Arc<Mutex<Vec<(i64, String)>>>;
+
 pub fn run_daemon(db: &Database, poll_seconds: u64) -> Result<()> {
     recover_interrupted_runs(db)?;
+    let orphans = Orphans::default();
 
     loop {
+        recover_orphaned_runs(db, &orphans);
         // Handles are dropped: runs finish on their own threads and record their own results.
-        dispatch_due_jobs(db, Local::now().naive_local())?;
+        dispatch_due_jobs(db, Local::now().naive_local(), &orphans)?;
         thread::sleep(Duration::from_secs(poll_seconds.max(1)));
     }
 }
@@ -23,6 +34,7 @@ pub fn run_daemon(db: &Database, poll_seconds: u64) -> Result<()> {
 pub fn dispatch_due_jobs(
     db: &Database,
     now: chrono::NaiveDateTime,
+    orphans: &Orphans,
 ) -> Result<Vec<thread::JoinHandle<()>>> {
     let mut handles = Vec::new();
     for job in db.get_due_jobs(now)? {
@@ -32,11 +44,24 @@ pub fn dispatch_due_jobs(
         match db.claim_scheduled_run(job.id, scheduled_for, next_run_at, runner::now())? {
             RunClaim::Claimed(run_id) => {
                 let db = db.clone();
+                let orphans = Arc::clone(orphans);
                 handles.push(thread::spawn(move || {
-                    if let Err(err) = run_claimed_job(&db, &job, run_id, scheduled_for, "schedule")
-                    {
-                        eprintln!("Could not record job '{}' run #{}: {err}", job.name, run_id);
-                    }
+                    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                        run_claimed_job(&db, &job, run_id, scheduled_for, "schedule")
+                    }));
+                    let reason = match outcome {
+                        Ok(Ok(())) => return,
+                        Ok(Err(err)) => err.to_string(),
+                        Err(_) => "worker thread panicked".to_string(),
+                    };
+                    eprintln!(
+                        "Could not record job '{}' run #{}: {reason}",
+                        job.name, run_id
+                    );
+                    orphans
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((run_id, reason));
                 }));
             }
             RunClaim::Skipped(_) => {
@@ -49,6 +74,48 @@ pub fn dispatch_due_jobs(
         }
     }
     Ok(handles)
+}
+
+/// Enable a job. If its next run passed while it was disabled, schedule the next future
+/// slot instead, so a `daily at 07:00` job enabled in the afternoon waits for tomorrow's
+/// 07:00 rather than firing at once. Returns the next run time.
+pub fn enable_job(
+    db: &Database,
+    name: &str,
+    now: chrono::NaiveDateTime,
+) -> Result<chrono::NaiveDateTime> {
+    db.set_enabled(name, true)?;
+    let job = db.get_job_by_name(name)?;
+    match job.next_run_at {
+        Some(next) if next > now => Ok(next),
+        _ => {
+            let next = schedule::parse_schedule(&job.schedule)?.next_after(now)?;
+            db.set_next_run_at(name, next)?;
+            Ok(next)
+        }
+    }
+}
+
+/// Mark runs abandoned by failed workers as `interrupted`. Any that the database still
+/// refuses stay queued for the next tick.
+pub fn recover_orphaned_runs(db: &Database, orphans: &Orphans) {
+    let pending = std::mem::take(&mut *orphans.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut still_pending = Vec::new();
+    for (run_id, reason) in pending {
+        let message = format!("cronlog could not record this run: {reason}");
+        match db.interrupt_run(run_id, runner::now(), &message) {
+            Ok(true) => println!("Marked run #{run_id} as interrupted: {message}"),
+            Ok(false) => {} // it was recorded after all
+            Err(err) => {
+                eprintln!("Still cannot mark run #{run_id} as interrupted: {err}");
+                still_pending.push((run_id, reason));
+            }
+        }
+    }
+    orphans
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(still_pending);
 }
 
 fn recover_interrupted_runs(db: &Database) -> Result<()> {
@@ -279,7 +346,7 @@ mod tests {
         db.add_job("quick", &quick_command(), "every 1 hours", 60, None, now)
             .expect("add quick");
 
-        let handles = dispatch_due_jobs(&db, now).expect("dispatch");
+        let handles = dispatch_due_jobs(&db, now, &Orphans::default()).expect("dispatch");
         assert_eq!(handles.len(), 2);
         thread::sleep(Duration::from_millis(1500));
         assert_eq!(last_status(&db, "quick"), "success");
@@ -298,10 +365,11 @@ mod tests {
         db.add_job("slow", &slow_command(), "every 1 seconds", 60, None, now)
             .expect("add slow");
 
-        let first = dispatch_due_jobs(&db, now).expect("first dispatch");
+        let orphans = Orphans::default();
+        let first = dispatch_due_jobs(&db, now, &orphans).expect("first dispatch");
         thread::sleep(Duration::from_millis(300));
-        let second =
-            dispatch_due_jobs(&db, now + chrono::Duration::seconds(1)).expect("second dispatch");
+        let second = dispatch_due_jobs(&db, now + chrono::Duration::seconds(1), &orphans)
+            .expect("second dispatch");
         assert!(
             second.is_empty(),
             "the overlapping slot must not start a run"
@@ -311,5 +379,101 @@ mod tests {
         for handle in first {
             handle.join().expect("run thread");
         }
+    }
+
+    #[test]
+    fn a_run_its_worker_could_not_record_is_interrupted_and_the_job_unblocked() {
+        let db = test_db();
+        let now = Local::now().naive_local();
+        db.add_job("quick", &quick_command(), "every 1 seconds", 60, None, now)
+            .expect("add quick");
+        let job = db.get_job_by_name("quick").expect("job");
+        // A claimed run whose worker failed before finish_run: still `running`.
+        let run_id = db
+            .create_run(job.id, "running", now, Some(now), "schedule")
+            .expect("run");
+        let orphans = Orphans::default();
+        orphans
+            .lock()
+            .unwrap()
+            .push((run_id, "database is locked".into()));
+
+        // While it is `running`, the next slot is skipped.
+        assert!(dispatch_due_jobs(&db, now, &Orphans::default())
+            .expect("dispatch")
+            .is_empty());
+        assert_eq!(last_status(&db, "quick"), "skipped");
+
+        recover_orphaned_runs(&db, &orphans);
+        assert!(orphans.lock().unwrap().is_empty());
+        let interrupted = db
+            .history("quick", 10)
+            .expect("history")
+            .into_iter()
+            .find(|row| row.run_id == run_id)
+            .expect("orphaned run");
+        assert_eq!(interrupted.status, "interrupted");
+
+        // The next slot runs again.
+        let handles =
+            dispatch_due_jobs(&db, now + chrono::Duration::seconds(2), &orphans).expect("dispatch");
+        assert_eq!(handles.len(), 1);
+        for handle in handles {
+            handle.join().expect("run thread");
+        }
+        assert_eq!(last_status(&db, "quick"), "success");
+    }
+
+    #[test]
+    fn enabling_a_job_whose_slot_passed_waits_for_the_next_slot() {
+        let db = test_db();
+        let added = at(6, 0, 0);
+        db.add_job(
+            "digest",
+            &quick_command(),
+            "daily at 07:00",
+            60,
+            None,
+            at(7, 0, 0),
+        )
+        .expect("add");
+        db.set_enabled("digest", false).expect("disable");
+
+        // Enabled at 13:00, after today's 07:00 passed: tomorrow 07:00, not now.
+        let afternoon = at(13, 0, 0);
+        let next = enable_job(&db, "digest", afternoon).expect("enable");
+        assert_eq!(next, at(7, 0, 0) + chrono::Duration::days(1));
+        assert!(db.get_due_jobs(afternoon).expect("due").is_empty());
+
+        // Enabled before its slot: the slot is kept.
+        db.set_enabled("digest", false).expect("disable");
+        db.set_next_run_at("digest", at(7, 0, 0)).expect("reset");
+        assert_eq!(
+            enable_job(&db, "digest", added).expect("enable"),
+            at(7, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_run_recorded_after_all_is_left_alone() {
+        let db = test_db();
+        let now = Local::now().naive_local();
+        db.add_job("quick", &quick_command(), "every 1 hours", 60, None, now)
+            .expect("add quick");
+        let job = db.get_job_by_name("quick").expect("job");
+        let run_id = db
+            .create_run(job.id, "running", now, Some(now), "schedule")
+            .expect("run");
+        db.finish_run(run_id, "success", now, 5, Some(0), None)
+            .expect("finish");
+        let orphans = Orphans::default();
+        orphans
+            .lock()
+            .unwrap()
+            .push((run_id, "logs insert failed".into()));
+
+        recover_orphaned_runs(&db, &orphans);
+        assert!(orphans.lock().unwrap().is_empty());
+        assert_eq!(last_status(&db, "quick"), "success");
     }
 }
