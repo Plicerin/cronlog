@@ -403,6 +403,10 @@ impl Database {
                 ON runs(job_id, trigger_type, status, scheduled_for);
             CREATE INDEX IF NOT EXISTS idx_hook_runs_status ON hook_runs(status, id);
             CREATE INDEX IF NOT EXISTS idx_hook_runs_run ON hook_runs(run_id);
+            -- Each job's latest finished hook (health, and what pruning must keep).
+            CREATE INDEX IF NOT EXISTS idx_hook_runs_job_finished
+                ON hook_runs(job_id, finished_at DESC, id DESC)
+                WHERE status NOT IN ('pending', 'running', 'skipped');
             "#,
         )?;
         if !jobs_has_column(&conn, "max_runs")? {
