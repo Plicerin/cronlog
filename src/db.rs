@@ -46,6 +46,69 @@ pub struct HistoryRow {
     pub error: Option<String>,
 }
 
+/// Hook events, as stored in `hook_runs.event` and in the settings keys.
+pub const HOOK_FAILURE: &str = "failure";
+pub const HOOK_RECOVERY: &str = "recovery";
+
+fn hook_key(event: &str) -> String {
+    format!("hook.on_{event}")
+}
+
+/// A queued hook, claimed to run, with what it needs to know about the run.
+#[derive(Debug)]
+pub struct PendingHook {
+    pub id: i64,
+    pub event: String,
+    pub failure_streak: i64,
+    pub run_id: i64,
+    pub job_name: String,
+    pub run_status: Option<String>,
+    pub exit_code: Option<i64>,
+    pub error: Option<String>,
+    pub finished_at: Option<NaiveDateTime>,
+    pub stderr: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HookRow {
+    pub hook_id: i64,
+    pub event: String,
+    pub job: String,
+    pub run_id: i64,
+    pub status: String,
+    pub failure_streak: i64,
+    #[serde(serialize_with = "clock::serialize_local")]
+    pub queued_at: Option<NaiveDateTime>,
+    #[serde(serialize_with = "clock::serialize_local")]
+    pub started_at: Option<NaiveDateTime>,
+    #[serde(serialize_with = "clock::serialize_local")]
+    pub finished_at: Option<NaiveDateTime>,
+    pub duration_ms: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub error: Option<String>,
+}
+
+const HOOK_ROW_SELECT: &str = "SELECT h.id, h.event, j.name, h.run_id, h.status, h.failure_streak,
+        h.queued_at, h.started_at, h.finished_at, h.duration_ms, h.exit_code, h.error
+     FROM hook_runs h JOIN jobs j ON j.id = h.job_id";
+
+fn row_to_hook(row: &rusqlite::Row<'_>) -> rusqlite::Result<HookRow> {
+    Ok(HookRow {
+        hook_id: row.get(0)?,
+        event: row.get(1)?,
+        job: row.get(2)?,
+        run_id: row.get(3)?,
+        status: row.get(4)?,
+        failure_streak: row.get(5)?,
+        queued_at: parse_dt_opt(row.get(6)?),
+        started_at: parse_dt_opt(row.get(7)?),
+        finished_at: parse_dt_opt(row.get(8)?),
+        duration_ms: row.get(9)?,
+        exit_code: row.get(10)?,
+        error: row.get(11)?,
+    })
+}
+
 #[derive(Debug)]
 pub struct InterruptedRun {
     pub run_id: i64,
@@ -112,6 +175,8 @@ pub struct RunResult<'a> {
     pub stderr: &'a str,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// The end of stderr when `stderr` is a truncated start, for a failure hook.
+    pub stderr_tail: Option<&'a str>,
 }
 
 /// The daemon's last sign of life, written every HEARTBEAT_EVERY.
@@ -153,6 +218,9 @@ pub struct PruneReport {
 
 /// One job's runs old enough to delete: job ?1, scheduled before the cutoff ?2, and older
 /// than the job's keep-last boundary run (?3 scheduled_for, ?4 id). Never a `running` run.
+/// Never a run whose hook is queued or running (its alert must still be sent), nor the
+/// run of the job's latest finished hook, which `cronlog health` reads: pruning must not
+/// clear `hook_failing` when no hook has succeeded since.
 ///
 /// Age is `scheduled_for`, the one timestamp every run has (an overlap skip has no
 /// `started_at`). Each query is a range scan on an index whose rows are nearly all
@@ -160,7 +228,13 @@ pub struct PruneReport {
 /// any `running` runs are scanned and kept.
 const PRUNABLE_FOR_JOB: &str = "FROM runs INDEXED BY idx_runs_job_scheduled
     WHERE job_id = ?1 AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
-      AND status <> 'running'";
+      AND status <> 'running'
+      AND NOT EXISTS (SELECT 1 FROM hook_runs h WHERE h.run_id = runs.id
+                      AND (h.status IN ('pending', 'running')
+                           OR h.id = (SELECT l.id FROM hook_runs l
+                                      WHERE l.job_id = h.job_id
+                                        AND l.status NOT IN ('pending', 'running', 'skipped')
+                                      ORDER BY l.finished_at DESC, l.id DESC LIMIT 1)))";
 
 /// For a live job with `--max-runs`: its limit is enforced by counting its scheduled,
 /// started runs, so only its overlap skips and its manual runs may go. Separate indexed
@@ -168,11 +242,23 @@ const PRUNABLE_FOR_JOB: &str = "FROM runs INDEXED BY idx_runs_job_scheduled
 /// index: left to itself SQLite picks idx_runs_job_scheduled and walks those runs.
 const PRUNABLE_SKIPS_FOR_BOUNDED_JOB: &str = "FROM runs INDEXED BY idx_runs_job_trigger_status
     WHERE job_id = ?1 AND trigger_type = 'schedule' AND status = 'skipped'
-      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)";
+      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
+      AND NOT EXISTS (SELECT 1 FROM hook_runs h WHERE h.run_id = runs.id
+                      AND (h.status IN ('pending', 'running')
+                           OR h.id = (SELECT l.id FROM hook_runs l
+                                      WHERE l.job_id = h.job_id
+                                        AND l.status NOT IN ('pending', 'running', 'skipped')
+                                      ORDER BY l.finished_at DESC, l.id DESC LIMIT 1)))";
 const PRUNABLE_MANUAL_FOR_BOUNDED_JOB: &str = "FROM runs INDEXED BY idx_runs_job_trigger_status
     WHERE job_id = ?1 AND trigger_type = 'manual'
       AND status IN ('success', 'failed', 'timed_out', 'interrupted', 'skipped')
-      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)";
+      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
+      AND NOT EXISTS (SELECT 1 FROM hook_runs h WHERE h.run_id = runs.id
+                      AND (h.status IN ('pending', 'running')
+                           OR h.id = (SELECT l.id FROM hook_runs l
+                                      WHERE l.job_id = h.job_id
+                                        AND l.status NOT IN ('pending', 'running', 'skipped')
+                                      ORDER BY l.finished_at DESC, l.id DESC LIMIT 1)))";
 
 /// The prunable-run filters for one job.
 fn prunable_filters(protect_counted: bool) -> &'static [&'static str] {
@@ -284,6 +370,29 @@ impl Database {
                 poll_seconds INTEGER NOT NULL
             );
 
+            -- Settings kept in the database, such as the failure and recovery hooks.
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            -- Hooks queued in the transaction that records a run, and how each went.
+            CREATE TABLE IF NOT EXISTS hook_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                job_id INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                status TEXT NOT NULL,
+                failure_streak INTEGER NOT NULL,
+                queued_at TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                duration_ms INTEGER,
+                exit_code INTEGER,
+                error TEXT,
+                stderr_tail TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(enabled, next_run_at, deleted_at);
             CREATE INDEX IF NOT EXISTS idx_runs_job_started ON runs(job_id, started_at);
             CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
@@ -292,6 +401,12 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_runs_job_status ON runs(job_id, status);
             CREATE INDEX IF NOT EXISTS idx_runs_job_trigger_status
                 ON runs(job_id, trigger_type, status, scheduled_for);
+            CREATE INDEX IF NOT EXISTS idx_hook_runs_status ON hook_runs(status, id);
+            CREATE INDEX IF NOT EXISTS idx_hook_runs_run ON hook_runs(run_id);
+            -- Each job's latest finished hook (health, and what pruning must keep).
+            CREATE INDEX IF NOT EXISTS idx_hook_runs_job_finished
+                ON hook_runs(job_id, finished_at DESC, id DESC)
+                WHERE status NOT IN ('pending', 'running', 'skipped');
             "#,
         )?;
         if !jobs_has_column(&conn, "max_runs")? {
@@ -753,6 +868,153 @@ impl Database {
         Ok(ManualClaim::Started(run_id))
     }
 
+    /// The command line set for a hook event, if any.
+    pub fn hook_command(&self, event: &str) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![hook_key(event)],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Set (Some) or remove (None) the command line for a hook event.
+    pub fn set_hook_command(&self, event: &str, command: Option<&str>) -> Result<()> {
+        let conn = self.conn()?;
+        match command {
+            Some(command) => conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![hook_key(event), command],
+            )?,
+            None => conn.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![hook_key(event)],
+            )?,
+        };
+        Ok(())
+    }
+
+    pub fn has_pending_hooks(&self) -> Result<bool> {
+        let conn = self.conn()?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hook_runs WHERE status = 'pending')",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Take the oldest queued hook and mark it `running`, in one transaction, so two
+    /// processes (the daemon and a manual run) never run the same hook.
+    /// Take the oldest queued hook (of one run, if given) and mark it running.
+    pub fn claim_pending_hook(
+        &self,
+        now: NaiveDateTime,
+        run_id: Option<i64>,
+    ) -> Result<Option<PendingHook>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending = tx
+            .query_row(
+                "SELECT h.id, h.event, h.failure_streak, h.run_id, j.name,
+                        r.status, r.exit_code, r.error, r.finished_at,
+                        COALESCE(h.stderr_tail,
+                            (SELECT l.stderr FROM logs l WHERE l.run_id = h.run_id ORDER BY l.id DESC LIMIT 1))
+                 FROM hook_runs h
+                 JOIN jobs j ON j.id = h.job_id
+                 LEFT JOIN runs r ON r.id = h.run_id
+                 WHERE h.status = 'pending' AND (?1 IS NULL OR h.run_id = ?1)
+                 ORDER BY h.id
+                 LIMIT 1",
+                params![run_id],
+                |r| {
+                    Ok(PendingHook {
+                        id: r.get(0)?,
+                        event: r.get(1)?,
+                        failure_streak: r.get(2)?,
+                        run_id: r.get(3)?,
+                        job_name: r.get(4)?,
+                        run_status: r.get(5)?,
+                        exit_code: r.get(6)?,
+                        error: r.get(7)?,
+                        finished_at: parse_dt_opt(r.get(8)?),
+                        stderr: r.get(9)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(hook) = &pending {
+            tx.execute(
+                "UPDATE hook_runs SET status = 'running', started_at = ?1 WHERE id = ?2",
+                params![now.to_string(), hook.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(pending)
+    }
+
+    pub fn finish_hook(
+        &self,
+        id: i64,
+        status: &str,
+        finished_at: NaiveDateTime,
+        duration_ms: i64,
+        exit_code: Option<i64>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE hook_runs SET status = ?1, finished_at = ?2, duration_ms = ?3, exit_code = ?4, error = ?5
+             WHERE id = ?6",
+            params![status, finished_at.to_string(), duration_ms, exit_code, error, id],
+        )?;
+        Ok(())
+    }
+
+    /// Hooks still `running` that started before `started_before` were left by a
+    /// process that stopped: mark them interrupted. Returns how many.
+    pub fn interrupt_stale_hooks(
+        &self,
+        started_before: NaiveDateTime,
+        finished_at: NaiveDateTime,
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        Ok(conn.execute(
+            "UPDATE hook_runs SET status = 'interrupted', finished_at = ?1,
+                    error = 'cronlog stopped while the hook was running'
+             WHERE status = 'running' AND started_at < ?2",
+            params![finished_at.to_string(), started_before.to_string()],
+        )?)
+    }
+
+    /// The newest hook runs, newest first.
+    pub fn hook_history(&self, limit: i64) -> Result<Vec<HookRow>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&format!("{HOOK_ROW_SELECT} ORDER BY h.id DESC LIMIT ?1"))?;
+        let rows = stmt.query_map(params![limit], row_to_hook)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The hook that most recently ran to an end (not queued, running or skipped), for
+    /// one job or any. Ordered by when it finished: the daemon and a manual run can run
+    /// hooks at the same time, so a later id can finish first.
+    pub fn last_finished_hook(&self, job: Option<&str>) -> Result<Option<HookRow>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                &format!(
+                    "{HOOK_ROW_SELECT} WHERE h.status NOT IN ('pending', 'running', 'skipped')
+                       AND (?1 IS NULL OR j.name = ?1)
+                     ORDER BY h.finished_at DESC, h.id DESC LIMIT 1"
+                ),
+                params![job],
+                row_to_hook,
+            )
+            .optional()?)
+    }
+
     /// Insert a run directly, for setting up test state.
     #[cfg(test)]
     pub fn create_run(
@@ -802,6 +1064,12 @@ impl Database {
                 result.stderr_truncated as i64
             ],
         )?;
+        if let Some(tail) = result.stderr_tail {
+            tx.execute(
+                "UPDATE hook_runs SET stderr_tail = ?1 WHERE run_id = ?2 AND status = 'pending'",
+                params![tail, run_id],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -968,6 +1236,7 @@ impl Database {
         let mut report = PruneReport::default();
         {
             let mut delete_logs = tx.prepare("DELETE FROM logs WHERE run_id = ?1")?;
+            let mut delete_hooks = tx.prepare("DELETE FROM hook_runs WHERE run_id = ?1")?;
             let mut delete_run = tx.prepare("DELETE FROM runs WHERE id = ?1")?;
             'jobs: for target in prune_targets(&tx, keep_last)? {
                 for filter in prunable_filters(target.protect_counted) {
@@ -990,6 +1259,7 @@ impl Database {
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     for id in ids {
                         report.logs += delete_logs.execute([id])?;
+                        delete_hooks.execute([id])?;
                         report.runs += delete_run.execute([id])?;
                     }
                 }
@@ -1345,7 +1615,18 @@ fn copy_access_list(from: &str, to: &str) -> std::io::Result<()> {
 
 /// Count a finished run toward its job's failure streak, in the transaction that
 /// records it, so the streak follows completion order.
+///
+/// When the job starts failing (its streak goes from 0 to 1) or recovers (a success
+/// after failures), and a hook is set for that, the hook is queued here too: the run's
+/// record and its alert commit together, whichever path recorded the run.
 fn update_failure_streak(conn: &Connection, run_id: i64, status: &str) -> Result<()> {
+    let before: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT j.id, j.failure_streak FROM jobs j JOIN runs r ON r.job_id = j.id WHERE r.id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
     conn.execute(
         "UPDATE jobs SET failure_streak = CASE
              WHEN ?2 IN ('failed', 'timed_out', 'interrupted') THEN failure_streak + 1
@@ -1354,6 +1635,32 @@ fn update_failure_streak(conn: &Connection, run_id: i64, status: &str) -> Result
          WHERE id = (SELECT job_id FROM runs WHERE id = ?1)",
         params![run_id, status],
     )?;
+
+    let Some((job_id, before)) = before else {
+        return Ok(());
+    };
+    let failed = matches!(status, "failed" | "timed_out" | "interrupted");
+    let event = if failed && before == 0 {
+        Some((HOOK_FAILURE, 1))
+    } else if status == "success" && before > 0 {
+        Some((HOOK_RECOVERY, before))
+    } else {
+        None
+    };
+    if let Some((event, streak)) = event {
+        let hook_set: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1)",
+            params![hook_key(event)],
+            |r| r.get(0),
+        )?;
+        if hook_set {
+            conn.execute(
+                "INSERT INTO hook_runs (run_id, job_id, event, status, failure_streak, queued_at)
+                 SELECT ?1, ?2, ?3, 'pending', ?4, finished_at FROM runs WHERE id = ?1",
+                params![run_id, job_id, event, streak],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1399,6 +1706,68 @@ fn parse_dt_opt(input: Option<String>) -> Option<NaiveDateTime> {
             .ok()
             .or_else(|| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok())
     })
+}
+
+/// Helpers other modules' tests use to set up a database.
+#[cfg(test)]
+pub mod tests_support {
+    use super::*;
+
+    pub fn test_db() -> Database {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("Cronlog-test-{unique}.db"));
+        let db = Database::open(&path).expect("open test db");
+        db.init().expect("init test db");
+        db
+    }
+
+    pub fn remove(db: Database) {
+        let _ = std::fs::remove_file(db.path);
+    }
+
+    /// Record a failed run (exit code 3, this error output) for `job`, adding the job if
+    /// it is new. Returns the run's id.
+    pub fn failed_run(db: &Database, job: &str, stderr: &str) -> i64 {
+        finished_run(db, job, "failed", Some(3), stderr)
+    }
+
+    pub fn finished_run(
+        db: &Database,
+        job: &str,
+        status: &str,
+        exit_code: Option<i64>,
+        stderr: &str,
+    ) -> i64 {
+        let when = clock::now();
+        if db.get_job_by_name(job).is_err() {
+            db.add_job(job, &["echo".into()], "every 1 hours", 3600, None, when)
+                .expect("add job");
+        }
+        let job_id = db.get_job_by_name(job).expect("job").id;
+        let run_id = db
+            .create_run(job_id, "running", when, Some(when), "schedule")
+            .expect("create run");
+        db.record_result(
+            run_id,
+            &RunResult {
+                status,
+                finished_at: when,
+                duration_ms: 10,
+                exit_code,
+                error: None,
+                stdout: "",
+                stderr,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                stderr_tail: None,
+            },
+        )
+        .expect("record result");
+        run_id
+    }
 }
 
 #[cfg(test)]

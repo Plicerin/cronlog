@@ -3,8 +3,10 @@ use crate::db::{
     RECLAIM_CHUNK_PAGES,
 };
 use crate::error::{CronlogError, Result};
-use crate::{clock, runner, schedule};
+use crate::{clock, hooks, runner, schedule};
+use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -129,6 +131,72 @@ impl Pruner {
     }
 }
 
+/// Runs queued hooks on a thread of its own, one batch at a time, so a slow hook
+/// never holds up the schedule.
+struct HookRunner {
+    busy: Arc<AtomicBool>,
+    last_sweep: Cell<Instant>,
+}
+
+/// A hook `running` longer than this was cut off: a live one ends within its timeout
+/// plus the drain grace.
+const STALE_HOOK_AFTER: Duration = Duration::from_secs(hooks::HOOK_TIMEOUT.as_secs() * 2);
+
+impl HookRunner {
+    fn new(db: &Database) -> Self {
+        Self::sweep(db);
+        Self {
+            busy: Arc::new(AtomicBool::new(false)),
+            last_sweep: Cell::new(Instant::now()),
+        }
+    }
+
+    /// Mark hooks left `running` by a process that stopped (this daemon before a
+    /// restart, or a manual run) as interrupted, so health sees them.
+    fn sweep(db: &Database) {
+        let now = clock::now();
+        let cutoff =
+            now - chrono::Duration::from_std(STALE_HOOK_AFTER).unwrap_or(chrono::Duration::zero());
+        match db.interrupt_stale_hooks(cutoff, now) {
+            Ok(0) => {}
+            Ok(n) => println!("Marked {n} hook run(s) left running as interrupted"),
+            Err(err) => eprintln!("Could not check for interrupted hooks: {err}"),
+        }
+    }
+
+    fn tick(&self, db: &Database) {
+        // Not only at start: a claim cut off just before a restart is too recent then.
+        if self.last_sweep.get().elapsed() >= hooks::HOOK_TIMEOUT {
+            Self::sweep(db);
+            self.last_sweep.set(Instant::now());
+        }
+        if self.busy.load(Ordering::SeqCst) {
+            return;
+        }
+        match db.has_pending_hooks() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                eprintln!("Could not check for queued hooks: {err}");
+                return;
+            }
+        }
+        self.busy.store(true, Ordering::SeqCst);
+        let busy = Arc::clone(&self.busy);
+        let db = db.clone();
+        thread::spawn(move || {
+            let outcome =
+                panic::catch_unwind(AssertUnwindSafe(|| hooks::dispatch_pending(&db, None)));
+            match outcome {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => eprintln!("Could not run hooks: {err}"),
+                Err(_) => eprintln!("Hook thread panicked"),
+            }
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+}
+
 /// How often the daemon records that it is alive, for `cronlog health`.
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 
@@ -172,6 +240,7 @@ pub fn run_daemon(db: &Database, poll_seconds: u64, retention: Option<Retention>
     let orphans = Orphans::default();
     let mut pruner = retention.map(Pruner::new);
     let mut heartbeat = HeartbeatWriter::new(clock::now(), poll_seconds.max(1));
+    let hook_runner = HookRunner::new(db);
 
     loop {
         recover_orphaned_runs(db, &orphans);
@@ -179,6 +248,7 @@ pub fn run_daemon(db: &Database, poll_seconds: u64, retention: Option<Retention>
         heartbeat.tick(db, now);
         // Handles are dropped: runs finish on their own threads and record their own results.
         dispatch_due_jobs(db, now, &orphans)?;
+        hook_runner.tick(db);
         if let Some(pruner) = pruner.as_mut() {
             pruner.tick(db, now);
         }
@@ -319,7 +389,14 @@ pub fn run_manual(
         job.command.join(" ")
     );
 
-    execute_claimed_run(db, job, run_id, scheduled_for, trigger_type, previous)
+    let result = execute_claimed_run(db, job, run_id, scheduled_for, trigger_type, previous);
+    // Send the hook this run queued (if any) before exiting; a daemon would also
+    // pick it up, and the claim keeps the two from both running it. Other queued
+    // hooks are left to the daemon, so a backlog can't hold up this command.
+    if let Err(err) = hooks::dispatch_pending(db, Some(run_id)) {
+        eprintln!("Could not run hooks: {err}");
+    }
+    result
 }
 
 fn run_claimed_job(
@@ -375,6 +452,7 @@ fn execute_claimed_run(
                     stderr: &out.stderr,
                     stdout_truncated: out.stdout_truncated,
                     stderr_truncated: out.stderr_truncated,
+                    stderr_tail: out.stderr_tail.as_deref(),
                 },
             )?;
             println!(
@@ -397,6 +475,7 @@ fn execute_claimed_run(
                     stderr: &message,
                     stdout_truncated: false,
                     stderr_truncated: false,
+                    stderr_tail: None,
                 },
             )?;
             println!("Failed job '{}' run #{}: {}", job.name, run_id, message);
@@ -790,6 +869,7 @@ mod tests {
             stderr: "",
             stdout_truncated: false,
             stderr_truncated: false,
+            stderr_tail: None,
         };
         db.record_result(id, &result).expect("record");
         assert_eq!(last_status(&db, "a"), "success");

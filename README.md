@@ -99,6 +99,7 @@ It reports:
 - `failing`: a job's last `--failures` (default 3) runs to finish all failed, timed out or were interrupted. Skipped runs are not counted, a success resets the count, and pruning old runs does not (the count is kept on the job, and starts when the database is first opened by a Cronlog with `health`)
 - `stuck`: a run is still `running` more than a minute after its timeout
 - `disabled`: the job named with `--job` is disabled. It is still checked for failures and stuck runs, not for being overdue. Without `--job`, disabled jobs are not checked
+- `hook_failing`: the newest failure or recovery hook to run did not succeed (see Failure hooks). It clears when a hook next succeeds
 
 Example:
 
@@ -107,6 +108,41 @@ UNHEALTHY: 2 problems
 - daemon (pid 4242) last seen 11m 3s ago, at 2026-11-17 22:15:18 -05:00 (daemon_stale)
 - sync: 3 runs in a row failed; newest, run #81, failed at 2026-11-17 22:10:00 -05:00, exit code 1 (failing)
 ```
+
+## Failure hooks
+
+A hook is a command Cronlog runs when a job starts failing or recovers, for example to send an alert. One hook per event covers every job:
+
+```bash
+cronlog hook set failure -- /usr/bin/python3 /opt/alerts/notify.py
+cronlog hook set recovery -- /usr/bin/python3 /opt/alerts/notify.py
+cronlog hook show
+cronlog hook test failure        # runs it now with sample values and CRONLOG_TEST=1; not recorded
+cronlog hook history             # recent hook runs
+cronlog hook clear recovery      # or `hook clear` for both
+```
+
+When they run:
+
+- `failure`: a job's first failed, timed-out or interrupted run after a success (or its first run ever). A job that keeps failing alerts once, not on every run
+- `recovery`: a job's first success after one or more failures
+- Skipped runs never trigger a hook, and manual runs count like scheduled ones
+
+Each hook is queued in the same transaction that records the run, then run by the daemon within a poll interval, or straight after `cronlog run --now`. A hook still queued when Cronlog stops runs the next time it starts, so alerts are not lost to a restart. One cut off while running (a crash or reboot mid-hook) is not retried, since it may already have sent its alert: it is recorded as `interrupted` and `cronlog health` reports it. Pruning keeps a run until its hook has run, and keeps each job's latest hook result, so it can't clear `hook_failing`. Runs interrupted by a daemon restart count as failures, so a reboot that kills a job alerts too.
+
+The command runs without a shell, like a job, with no stdin, its stdout discarded and its stderr kept if it fails. It is killed after 30 seconds. It gets these variables, and none it would otherwise inherit from a job or hook that started Cronlog:
+
+| Variable | Value |
+|---|---|
+| `CRONLOG_EVENT` | `failure` or `recovery` |
+| `CRONLOG_JOB_NAME`, `CRONLOG_RUN_ID` | the run that triggered it |
+| `CRONLOG_STATUS`, `CRONLOG_EXIT_CODE`, `CRONLOG_ERROR` | how that run ended (exit code and error only when there is one) |
+| `CRONLOG_FINISHED_AT` | when it ended, in local time |
+| `CRONLOG_FAILURE_STREAK` | `1` for a failure; for a recovery, how many runs in a row had failed |
+| `CRONLOG_STDERR_TAIL` | the last 20 lines (at most 2000 bytes) of the run's error output, when there is any, even when the logged output was truncated |
+| `CRONLOG_TEST` | `1` under `cronlog hook test` only |
+
+Each hook run is recorded (`cronlog hook history`, or `--json`), and `cronlog health` reports `hook_failing` while the newest one failed, so a broken notifier does not stay silent.
 
 ## Times and daylight saving
 

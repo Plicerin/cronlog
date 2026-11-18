@@ -14,7 +14,11 @@ const MAX_STDERR_BYTES: usize = 256 * 1024;
 /// How long to keep reading output after the job exits (or is killed). A process the job
 /// started in the background can inherit stdout/stderr and keep them open for hours; the
 /// run must still finish.
-const DRAIN_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// The end of the error output kept alongside a truncated log, so a failure hook
+/// still sees the last lines (usually the actual error).
+const TAIL_BYTES: usize = 4096;
 
 #[derive(Debug)]
 pub struct RunOutput {
@@ -24,6 +28,8 @@ pub struct RunOutput {
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// The last bytes of stderr, when the logged stderr was truncated.
+    pub stderr_tail: Option<String>,
     pub duration_ms: i64,
     pub error: Option<String>,
 }
@@ -38,17 +44,28 @@ pub struct ExecuteContext {
     pub previous_status: Option<String>,
 }
 
-/// Output read from one stream: the first `limit` bytes, and whether there was more.
+/// Output read from one stream: the first (or last) `limit` bytes, and whether there
+/// was more.
 #[derive(Debug, Default)]
-struct Captured {
-    bytes: Vec<u8>,
-    truncated: bool,
+pub(crate) struct Captured {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
+    /// With `Keep::First`, the last TAIL_BYTES read, whatever was kept.
+    tail: Vec<u8>,
     error: Option<String>,
+}
+
+/// Which part of a stream longer than its limit a reader keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Keep {
+    First,
+    /// The end, where an error message usually is.
+    Last,
 }
 
 /// A stream being read on its own thread: what it has read so far, a signal at EOF, and a
 /// flag that stops it.
-struct Reader {
+pub(crate) struct Reader {
     name: &'static str,
     captured: Arc<Mutex<Captured>>,
     cancel: Arc<AtomicBool>,
@@ -160,6 +177,9 @@ pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
         stdout,
         max_log_bytes("CRONLOG_MAX_STDOUT_BYTES", MAX_STDOUT_BYTES),
     );
+    let stderr_tail = stderr
+        .truncated
+        .then(|| String::from_utf8_lossy(&stderr.tail).into_owned());
     let (stderr, stderr_truncated) = to_logged_string(
         stderr,
         max_log_bytes("CRONLOG_MAX_STDERR_BYTES", MAX_STDERR_BYTES),
@@ -179,6 +199,7 @@ pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
             stderr,
             stdout_truncated,
             stderr_truncated,
+            stderr_tail,
             duration_ms,
             error: Some(
                 [
@@ -212,6 +233,7 @@ pub fn execute(job: &Job, context: &ExecuteContext) -> Result<RunOutput> {
         stderr,
         stdout_truncated,
         stderr_truncated,
+        stderr_tail,
         duration_ms,
         error: log_capture_error,
     })
@@ -228,9 +250,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// pipe open past DRAIN_GRACE, the thread, the pipe and a fresh capture buffer outlived
 /// the run, one set per run of a recurring job.
 fn spawn_reader<R: PollRead + Send + 'static>(
+    source: R,
+    limit: usize,
+    name: &'static str,
+) -> Reader {
+    spawn_reader_keeping(source, limit, name, Keep::First)
+}
+
+pub(crate) fn spawn_reader_keeping<R: PollRead + Send + 'static>(
     mut source: R,
     limit: usize,
     name: &'static str,
+    keep: Keep,
 ) -> Reader {
     let captured = Arc::new(Mutex::new(Captured::default()));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -253,11 +284,26 @@ fn spawn_reader<R: PollRead + Send + 'static>(
                 Ok(0) => break,
                 Ok(n) => {
                     let mut captured = shared.lock().unwrap_or_else(|e| e.into_inner());
-                    let room = limit.saturating_sub(captured.bytes.len());
-                    if n > room {
-                        captured.truncated = true;
+                    match keep {
+                        Keep::First => {
+                            let room = limit.saturating_sub(captured.bytes.len());
+                            if n > room {
+                                captured.truncated = true;
+                            }
+                            captured.bytes.extend_from_slice(&buf[..n.min(room)]);
+                            captured.tail.extend_from_slice(&buf[..n]);
+                            let excess = captured.tail.len().saturating_sub(TAIL_BYTES);
+                            captured.tail.drain(..excess);
+                        }
+                        Keep::Last => {
+                            captured.bytes.extend_from_slice(&buf[..n]);
+                            let excess = captured.bytes.len().saturating_sub(limit);
+                            if excess > 0 {
+                                captured.truncated = true;
+                                captured.bytes.drain(..excess);
+                            }
+                        }
                     }
-                    captured.bytes.extend_from_slice(&buf[..n.min(room)]);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(err) => {
@@ -281,7 +327,11 @@ fn spawn_reader<R: PollRead + Send + 'static>(
 
 /// What a reader captured. Waits until `deadline` for EOF; past that, stops the reader,
 /// closes the stream and keeps what was read so far. The reader thread is always joined.
-fn collect(reader: Option<Reader>, deadline: Instant, errors: &mut Vec<String>) -> Captured {
+pub(crate) fn collect(
+    reader: Option<Reader>,
+    deadline: Instant,
+    errors: &mut Vec<String>,
+) -> Captured {
     let Some(mut reader) = reader else {
         return Captured::default();
     };
@@ -308,7 +358,7 @@ fn collect(reader: Option<Reader>, deadline: Instant, errors: &mut Vec<String>) 
 }
 
 /// A pipe that can wait for data with a timeout, so its reader can be cancelled.
-trait PollRead: Read {
+pub(crate) trait PollRead: Read {
     /// Ok(true) when a read will not block (data or EOF), Ok(false) on timeout.
     fn wait_readable(&self, timeout: Duration) -> std::io::Result<bool>;
 }
@@ -390,7 +440,7 @@ fn to_logged_string(captured: Captured, max_bytes: usize) -> (String, bool) {
 /// running when the command is a wrapper (`bash -lc 'python ...'`), and the orphans keep
 /// stdout/stderr open, so the timeout did not end the run.
 #[cfg(unix)]
-fn kill_process_tree(child: &mut Child) {
+pub(crate) fn kill_process_tree(child: &mut Child) {
     // The child leads its own process group (process_group(0) above): its pid is the pgid.
     let pgid = child.id() as libc::pid_t;
     // SAFETY: a plain kill(2); a negative pid means "every process in group pgid".
@@ -401,7 +451,7 @@ fn kill_process_tree(child: &mut Child) {
 }
 
 #[cfg(windows)]
-fn kill_process_tree(child: &mut Child) {
+pub(crate) fn kill_process_tree(child: &mut Child) {
     // taskkill /T walks the tree from the parent, so it must run before the parent dies.
     let _ = Command::new("taskkill")
         .args(["/T", "/F", "/PID", &child.id().to_string()])
@@ -413,7 +463,7 @@ fn kill_process_tree(child: &mut Child) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn kill_process_tree(child: &mut Child) {
+pub(crate) fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
@@ -519,6 +569,48 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("still open"));
+    }
+
+    #[test]
+    fn a_tail_reader_keeps_only_the_end() {
+        use std::io::Write;
+        let (pipe_reader, mut writer) = std::io::pipe().expect("pipe");
+        let reader = spawn_reader_keeping(pipe_reader, 100, "stderr", Keep::Last);
+        for _ in 0..50 {
+            writer.write_all(&[b'x'; 1000]).expect("write");
+        }
+        writer.write_all(b"the real error").expect("write");
+        drop(writer);
+        let captured = collect(
+            Some(reader),
+            Instant::now() + Duration::from_secs(5),
+            &mut Vec::new(),
+        );
+        assert!(captured.truncated);
+        assert_eq!(captured.bytes.len(), 100);
+        assert!(captured.bytes.ends_with(b"the real error"));
+    }
+
+    #[test]
+    fn a_truncated_reader_also_keeps_the_end() {
+        use std::io::Write;
+        let (pipe_reader, mut writer) = std::io::pipe().expect("pipe");
+        let reader = spawn_reader(pipe_reader, 100, "stderr");
+        writer.write_all(b"the start").expect("write");
+        for _ in 0..50 {
+            writer.write_all(&[b'x'; 1000]).expect("write");
+        }
+        writer.write_all(b"the real error").expect("write");
+        drop(writer);
+        let captured = collect(
+            Some(reader),
+            Instant::now() + Duration::from_secs(5),
+            &mut Vec::new(),
+        );
+        assert!(captured.truncated);
+        assert!(captured.bytes.starts_with(b"the start"));
+        assert_eq!(captured.tail.len(), TAIL_BYTES);
+        assert!(captured.tail.ends_with(b"the real error"));
     }
 
     #[test]
