@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cronlog: cron with a memory</title>
+  <meta name="description" content="Cronlog is a small local scheduler that records every run: when it was due, when it started, how it ended and what it printed, in one SQLite file. Open source, Linux and Windows.">
+  <meta name="theme-color" content="#050505">
+  <meta property="og:title" content="Cronlog: cron with a memory">
+  <meta property="og:description" content="A small local scheduler with durable run history, captured logs, timeouts, overlap protection and a health check.">
+  <meta property="og:type" content="website">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main>
+  <div class="progress-line" aria-hidden="true"></div>
+
+  <nav class="site-nav" aria-label="Main">
+    <a href="#top" class="wordmark"><span>cron</span>log</a>
+    <div class="nav-links">
+      <a href="#product">Product</a>
+      <a href="#features">Features</a>
+      <a href="#compare">Compared to cron</a>
+      <a href="#install">Install</a>
+    </div>
+    <a class="button nav-cta" href="https://github.com/Plicerin/cronlog">GitHub <span aria-hidden="true">→</span></a>
+  </nav>
+
+  <!-- 01 Hero -->
+  <section id="top" class="hero-scene">
+    <div class="hero-grid" aria-hidden="true"></div>
+    <div class="hero-copy">
+      <p class="eyebrow on-dark">A durable local scheduler</p>
+      <h1>Every run.<br><span>Accounted for.</span></h1>
+      <p class="hero-lede">Cronlog is cron with a memory. It runs your scripts on a schedule and records every run: when it was due, when it started, how it ended and what it printed. It keeps all of it in one SQLite file on your machine.</p>
+      <div class="hero-actions">
+        <a class="button primary-action" href="#install">Install from source <span aria-hidden="true">→</span></a>
+        <a class="button secondary-action" href="https://github.com/Plicerin/cronlog">View on GitHub</a>
+      </div>
+      <p class="hero-detail">Open source (<a href="https://github.com/Plicerin/cronlog/blob/master/LICENSE">MIT</a>) · Linux and Windows · one binary, one database file</p>
+    </div>
+    <div class="hero-product">
+     <div class="hero-stage-in">
+      <div class="hero-stage">
+      <div class="hero-glow" aria-hidden="true"></div>
+      <div class="terminal win win-back" aria-hidden="true">
+        <div class="frame-top"><span></span><span></span><span></span><b>~ · cronlog logs</b></div>
+        <pre class="terminal-body"><b>$</b> cronlog logs report --last
+Logs for run #412
+
+--- STDOUT ---
+fetching 3 sources
+source 1/3 ok
+
+--- STDERR ---
+<em class="bad">error: source 2/3 returned HTTP 503</em></pre>
+      </div>
+      <div class="terminal win win-mid" aria-hidden="true">
+        <div class="frame-top"><span></span><span></span><span></span><b>~ · cronlog history</b></div>
+        <pre class="terminal-body"><b>$</b> cronlog history report --limit 3   <i># some columns left out</i>
+<i>┌─────┬────────┬──────────┬──────────┬──────┐</i>
+<i>│</i> Run <i>┆</i> Status <i>┆</i> Trigger  <i>┆</i> Duration <i>┆</i> Exit <i>│</i>
+<i>╞═════╪════════╪══════════╪══════════╪══════╡</i>
+<i>│</i> 412 <i>┆</i> <em class="bad">failed</em> <i>┆</i> schedule <i>┆</i> 2140ms   <i>┆</i> 2    <i>│</i>
+<i>│</i> 411 <i>┆</i> <em class="bad">failed</em> <i>┆</i> schedule <i>┆</i> 2087ms   <i>┆</i> 2    <i>│</i>
+<i>│</i> 410 <i>┆</i> <em class="bad">failed</em> <i>┆</i> schedule <i>┆</i> 2203ms   <i>┆</i> 2    <i>│</i>
+<i>└─────┴────────┴──────────┴──────────┴──────┘</i></pre>
+      </div>
+      <div class="terminal win win-front" role="img" aria-label="Example output of cronlog status and cronlog health">
+        <div class="frame-top"><span></span><span></span><span></span><b>~ · cronlog status</b></div>
+        <pre class="terminal-body"><b>$</b> cronlog status   <i># some columns left out</i>
+<i>┌────────────────┬──────────────────┬─────────────┬──────┐</i>
+<i>│</i> Name           <i>┆</i> Schedule         <i>┆</i> Last Status <i>┆</i> Exit <i>│</i>
+<i>╞════════════════╪══════════════════╪═════════════╪══════╡</i>
+<i>│</i> nightly-backup <i>┆</i> daily at 02:00   <i>┆</i> <em class="ok">success</em>     <i>┆</i> 0    <i>│</i>
+<i>│</i> sync           <i>┆</i> every 15 minutes <i>┆</i> <em class="ok">success</em>     <i>┆</i> 0    <i>│</i>
+<i>│</i> digest         <i>┆</i> daily at 07:00   <i>┆</i> <em class="ok">success</em>     <i>┆</i> 0    <i>│</i>
+<i>│</i> report         <i>┆</i> every 1 hours    <i>┆</i> <em class="bad">failed</em>      <i>┆</i> 2    <i>│</i>
+<i>└────────────────┴──────────────────┴─────────────┴──────┘</i>
+
+<b>$</b> cronlog health
+UNHEALTHY: 1 problem
+- report: 3 runs in a row failed; newest, run #412, failed at
+  2026-11-18 10:00:04 -05:00, exit code 2 <i>(failing)</i>
+<b>$</b> <span class="terminal-cursor"></span></pre>
+      </div>
+      </div>
+     </div>
+    </div>
+    <div class="hero-bottom" aria-hidden="true"><span>01 / 08</span><span>Scroll</span><span>↓</span></div>
+  </section>
+
+  <!-- 02 Transformation -->
+  <section class="transformation">
+    <div class="section-wrap transformation-grid">
+      <div class="reveal">
+        <p class="eyebrow">Why it exists</p>
+        <h2>Your jobs are small.<br>The uncertainty around them isn’t.</h2>
+      </div>
+      <div class="transformation-proof reveal">
+        <p>Plain cron starts a command and forgets it. Did it run? Did it fail? What did it print? Cronlog keeps the answer to each of those questions for every run.</p>
+        <div class="proof-lines">
+          <span><i aria-hidden="true">✓</i> each scheduled slot claimed exactly once</span>
+          <span><i aria-hidden="true">✓</i> stdout and stderr kept with the run</span>
+          <span><i aria-hidden="true">✓</i> <code>cronlog health</code> exits 1 when something is wrong</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 03 Product story (sticky) -->
+  <section id="product" class="product-story">
+    <div class="product-sticky">
+      <div class="product-intro">
+        <p class="eyebrow on-dark">One record of what ran</p>
+        <h2>Ask it<br>what happened.</h2>
+      </div>
+      <div class="product-frame" data-angle="0">
+        <div class="frame-top"><span></span><span></span><span></span><b>cronlog</b></div>
+        <pre class="terminal-body view view-0"><b>$</b> cronlog add --name nightly-backup --schedule "daily at 02:00" \
+    --timeout 30m -- ./backup.sh
+Added job 'nightly-backup' scheduled for 2026-11-19 02:00:00 -05:00
+
+<b>$</b> cronlog add --name sync --schedule "every 15 minutes" -- ./sync.sh
+Added job 'sync' scheduled for 2026-11-18 10:15:00 -05:00
+
+<b>$</b> cronlog daemon
+Cronlog daemon started. polling every 1s, keeping 30days of history
+(at least 20 runs per job). press Ctrl+C to stop.
+<span class="terminal-cursor"></span></pre>
+        <pre class="terminal-body view view-1"><b>$</b> cronlog history nightly-backup --limit 4   <i># some columns left out</i>
+<i>┌─────┬───────────┬──────────┬────────────────────────────┬───────────┬──────┐</i>
+<i>│</i> Run <i>┆</i> Status    <i>┆</i> Trigger  <i>┆</i> Scheduled                  <i>┆</i> Duration  <i>┆</i> Exit <i>│</i>
+<i>╞═════╪═══════════╪══════════╪════════════════════════════╪═══════════╪══════╡</i>
+<i>│</i> 412 <i>┆</i> <em class="ok">success</em>   <i>┆</i> schedule <i>┆</i> 2026-11-18 02:00:00 -05:00 <i>┆</i> 41213ms   <i>┆</i> 0    <i>│</i>
+<i>│</i> 388 <i>┆</i> <em class="ok">success</em>   <i>┆</i> schedule <i>┆</i> 2026-11-17 02:00:00 -05:00 <i>┆</i> 39874ms   <i>┆</i> 0    <i>│</i>
+<i>│</i> 365 <i>┆</i> <em class="bad">timed_out</em> <i>┆</i> schedule <i>┆</i> 2026-11-16 02:00:00 -05:00 <i>┆</i> 1800412ms <i>┆</i> -    <i>│</i>
+<i>│</i> 341 <i>┆</i> <em class="ok">success</em>   <i>┆</i> schedule <i>┆</i> 2026-11-15 02:00:00 -05:00 <i>┆</i> 40517ms   <i>┆</i> 0    <i>│</i>
+<i>└─────┴───────────┴──────────┴────────────────────────────┴───────────┴──────┘</i>
+
+<i># stored in UTC, shown in your time zone</i></pre>
+        <pre class="terminal-body view view-2"><b>$</b> cronlog logs nightly-backup --last
+Logs for run #412
+
+--- STDOUT ---
+snapshot 9f3c2e1 saved
+backed up 1,204 files (2.3 GB)
+
+--- STDERR ---
+&lt;empty&gt;</pre>
+      </div>
+      <div class="product-steps" aria-hidden="true"><span class="is-active">01 / SCHEDULE</span><span>02 / HISTORY</span><span>03 / OUTPUT</span></div>
+    </div>
+  </section>
+
+  <!-- 04 Features -->
+  <section id="features" class="feature-sequence">
+    <article class="feature-scene feature-dark">
+      <div class="section-wrap feature-grid">
+        <div class="feature-copy reveal">
+          <p class="feature-number">01</p>
+          <p class="eyebrow">Durable history</p>
+          <h2>Every run is a record.</h2>
+          <p>When it was due, when it started and finished, its status, exit code and duration. A run is never just a line in syslog.</p>
+        </div>
+        <div class="code-stage reveal"><div class="code-note">RUN #412 · SUCCESS · 41213MS</div><code><span>$</span> cronlog history nightly-backup --limit 20</code><div class="code-lines" aria-hidden="true"><i></i><i></i><i></i><i></i></div></div>
+      </div>
+    </article>
+
+    <article class="feature-scene feature-light">
+      <div class="section-wrap feature-grid">
+        <div class="feature-copy reveal">
+          <p class="feature-number">02</p>
+          <p class="eyebrow">Captured output</p>
+          <h2>The evidence stays local.</h2>
+          <p>Cronlog reads stdout and stderr while the job runs, up to 256 KB each, and keeps them with the run. Large output never blocks the job.</p>
+        </div>
+        <div class="code-stage reveal"><div class="code-note">STDOUT · STDERR · KEPT</div><code><span>$</span> cronlog logs sync --run-id 4821</code><div class="code-lines" aria-hidden="true"><i></i><i></i><i></i><i></i></div></div>
+      </div>
+    </article>
+
+    <article class="feature-scene feature-dark">
+      <div class="section-wrap feature-grid">
+        <div class="feature-copy reveal">
+          <p class="feature-number">03</p>
+          <p class="eyebrow">Overlaps and timeouts</p>
+          <h2>No pile-ups. No zombies.</h2>
+          <p>A scheduled run never starts on top of the last one: a slot that comes round while the job is still running is recorded as skipped. A timeout kills the job's whole process tree, not just the first process.</p>
+        </div>
+        <div class="code-stage reveal"><div class="code-note">OVERLAP · SKIPPED AND RECORDED</div><code><span>$</span> cronlog add --name sync --schedule "every 15 minutes" --timeout 10m -- ./sync.sh</code><div class="code-lines" aria-hidden="true"><i></i><i></i><i></i><i></i></div></div>
+      </div>
+    </article>
+
+    <article class="feature-scene feature-light">
+      <div class="section-wrap feature-grid">
+        <div class="feature-copy reveal">
+          <p class="feature-number">04</p>
+          <p class="eyebrow">Health checks</p>
+          <h2>It tells you when it’s not okay.</h2>
+          <p>The daemon checks in every 30 seconds. <code>cronlog health</code> reports a daemon that has stopped, a run that is overdue, a job failing again and again, or a run stuck past its timeout, and exits 1 so a watchdog can act.</p>
+        </div>
+        <div class="code-stage reveal"><div class="code-note">EXIT 1 · 2 PROBLEMS</div><code><span>$</span> cronlog health || notify "cronlog needs a look"</code><div class="code-lines" aria-hidden="true"><i></i><i></i><i></i><i></i></div></div>
+      </div>
+    </article>
+
+    <article class="feature-scene feature-dark">
+      <div class="section-wrap feature-grid">
+        <div class="feature-copy reveal">
+          <p class="feature-number">05</p>
+          <p class="eyebrow">Daylight-saving safe</p>
+          <h2>The clock changes. Your jobs don’t notice.</h2>
+          <p>Times are stored in UTC. Interval jobs keep an even pace through the night the clocks change. A <code>daily at</code> job keeps its local time: when the clocks go back it runs once, and when they jump forward it runs as soon as the clock jumps.</p>
+        </div>
+        <div class="code-stage reveal"><div class="code-note">NEXT RUN · 07:00 -05:00</div><code><span>$</span> cronlog add --name digest --schedule "daily at 07:00" -- ./digest.sh</code><div class="code-lines" aria-hidden="true"><i></i><i></i><i></i><i></i></div></div>
+      </div>
+    </article>
+
+    <article class="feature-scene feature-light">
+      <div class="section-wrap feature-grid">
+        <div class="feature-copy reveal">
+          <p class="feature-number">06</p>
+          <p class="eyebrow">Retention</p>
+          <h2>History that stays small.</h2>
+          <p>Once a day the daemon deletes runs older than 30 days, a small batch at a time, and gives the space back to the disk. It always keeps each job's newest 20 runs. Set your own limits, or keep everything.</p>
+        </div>
+        <div class="code-stage reveal"><div class="code-note">KEEP 90 DAYS · NEWEST 50 PER JOB</div><code><span>$</span> cronlog daemon --retain 90d --keep-last 50</code><div class="code-lines" aria-hidden="true"><i></i><i></i><i></i><i></i></div></div>
+      </div>
+    </article>
+  </section>
+
+  <!-- 05 Scripting -->
+  <section class="devices-scene">
+    <div class="section-wrap devices-copy reveal">
+      <p class="eyebrow on-dark">Made for scripts and the people on call</p>
+      <h2>Calm enough<br>to trust at 3:00 AM.</h2>
+      <p>Every inspection command speaks JSON. Every job knows which run it is, and how the last one went.</p>
+    </div>
+    <div class="section-wrap script-grid">
+      <div class="terminal reveal">
+        <div class="frame-top"><span></span><span></span><span></span><b>JSON for scripts</b></div>
+        <pre class="terminal-body small"><b>$</b> cronlog --json history sync --limit 1
+[
+  {
+    "run_id": 4821,
+    "status": "success",
+    "trigger_type": "schedule",
+    "scheduled_for": "2026-11-18T09:45:00-05:00",
+    "started_at": "2026-11-18T09:45:00.104511200-05:00",
+    "finished_at": "2026-11-18T09:45:01.944870300-05:00",
+    "duration_ms": 1840,
+    "exit_code": 0,
+    "error": null
+  }
+]</pre>
+      </div>
+      <div class="terminal reveal">
+        <div class="frame-top"><span></span><span></span><span></span><b>What each job is told</b></div>
+        <pre class="terminal-body small"><i># set in every job's environment</i>
+CRONLOG_RUN_ID=4821
+CRONLOG_JOB_NAME=sync
+CRONLOG_SCHEDULED_FOR=2026-11-18 09:45:00
+CRONLOG_TRIGGER_TYPE=schedule
+CRONLOG_PREVIOUS_RUN_ID=4820
+CRONLOG_PREVIOUS_STATUS=failed
+
+<i># so a job can resume where the last one stopped</i></pre>
+      </div>
+    </div>
+    <ul class="section-wrap small-facts reveal">
+      <li><b>Restart recovery.</b> Runs left <code>running</code> when the daemon stopped are marked <code>interrupted</code>, with a note in their log.</li>
+      <li><b>Parallel jobs.</b> Each due job runs on its own thread, so a slow one never delays the others.</li>
+      <li><b>Bounded pilots.</b> <code>--max-runs 12</code> disables a job after 12 scheduled runs.</li>
+      <li><b>Missed runs.</b> After downtime a job runs once, then picks up its normal schedule.</li>
+    </ul>
+  </section>
+
+  <!-- 06 Metrics -->
+  <section class="metrics-scene">
+    <div class="section-wrap">
+      <p class="eyebrow">Less machinery</p>
+      <h2>Small on purpose.</h2>
+      <div class="metrics-grid">
+        <div class="metric"><strong data-count="1">1</strong><span>binary to install</span></div>
+        <div class="metric"><strong data-count="1">1</strong><span>SQLite file holds everything</span></div>
+        <div class="metric"><strong data-count="0">0</strong><span>servers, accounts or cloud services</span></div>
+        <div class="metric"><strong data-count="2">2</strong><span>platforms tested on every change: Linux and Windows</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 07 Comparison -->
+  <section id="compare" class="comparison-scene">
+    <div class="comparison-head reveal">
+      <p class="eyebrow">Compared to plain cron</p>
+      <h2>Same simple idea.<br>Now with a memory.</h2>
+    </div>
+    <div class="comparison-table">
+      <div class="comparison-side old">
+        <p id="cmp-cron">Plain cron</p>
+        <div role="table" aria-labelledby="cmp-cron">
+          <div role="row"><span role="rowheader">Did it run?</span><b role="cell"><i aria-hidden="true">✕</i> Search the system log</b></div>
+          <div role="row"><span role="rowheader">What did it print?</span><b role="cell"><i aria-hidden="true">✕</i> Mailed, or lost</b></div>
+          <div role="row"><span role="rowheader">Still running from last time</span><b role="cell"><i aria-hidden="true">✕</i> A second copy starts</b></div>
+          <div role="row"><span role="rowheader">A job hangs</span><b role="cell"><i aria-hidden="true">✕</i> It runs until someone notices</b></div>
+          <div role="row"><span role="rowheader">The scheduler stops</span><b role="cell"><i aria-hidden="true">✕</i> Silence</b></div>
+        </div>
+      </div>
+      <div class="comparison-side new">
+        <p id="cmp-cronlog">Cronlog</p>
+        <div role="table" aria-labelledby="cmp-cronlog">
+          <div role="row"><span role="rowheader">Did it run?</span><b role="cell"><i aria-hidden="true">✓</i> <code>cronlog history &lt;job&gt;</code></b></div>
+          <div role="row"><span role="rowheader">What did it print?</span><b role="cell"><i aria-hidden="true">✓</i> Kept with the run</b></div>
+          <div role="row"><span role="rowheader">Still running from last time</span><b role="cell"><i aria-hidden="true">✓</i> Skipped, and recorded</b></div>
+          <div role="row"><span role="rowheader">A job hangs</span><b role="cell"><i aria-hidden="true">✓</i> Killed at its timeout</b></div>
+          <div role="row"><span role="rowheader">The scheduler stops</span><b role="cell"><i aria-hidden="true">✓</i> <code>cronlog health</code> exits 1</b></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 08 Scope -->
+  <section class="proof-scene">
+    <div class="quote-wrap reveal">
+      <p class="eyebrow">What it is not</p>
+      <blockquote>Not a workflow orchestrator. <em>Cron’s simple idea,</em> with a durable audit trail.</blockquote>
+      <p class="scope-note">Cronlog doesn't try to replace Airflow, Temporal or a job queue. Retries, checkpoints and publish-once logic belong in your pipeline. Cronlog gives that pipeline a reliable clock and a record it can read.</p>
+    </div>
+  </section>
+
+  <!-- 09 Install -->
+  <section id="install" class="pricing-scene">
+    <div class="section-wrap">
+      <div class="pricing-head reveal">
+        <p class="eyebrow on-dark">Free and open source</p>
+        <h2>Running in<br>three steps.</h2>
+      </div>
+      <ol class="install-list">
+        <li class="install-step reveal">
+          <div><p>Step 1</p><h3>Build</h3><span>Needs a Rust toolchain. The binary lands in <code>target/release/</code>; put it on your PATH.</span></div>
+          <pre><code>git clone https://github.com/Plicerin/cronlog
+cd cronlog
+cargo build --release</code></pre>
+        </li>
+        <li class="install-step reveal">
+          <div><p>Step 2</p><h3>Add a job</h3><span>Commands run directly, not through a shell. For pipes and <code>&amp;&amp;</code>, call <code>sh -c</code>.</span></div>
+          <pre><code>cronlog add --name backup \
+  --schedule "daily at 02:00" -- ./backup.sh</code></pre>
+        </li>
+        <li class="install-step reveal">
+          <div><p>Step 3</p><h3>Start the daemon</h3><span>Run it in a terminal, or as a systemd service using the runbook.</span></div>
+          <pre><code>cronlog daemon</code></pre>
+        </li>
+      </ol>
+      <div class="schedule-forms reveal">
+        <p>Schedules</p>
+        <ul>
+          <li><code>every N seconds</code></li>
+          <li><code>every N minutes</code></li>
+          <li><code>every N hours</code></li>
+          <li><code>daily at HH:MM</code></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10 Final -->
+  <section class="final-scene">
+    <p class="eyebrow">It’s time to know what ran.</p>
+    <h2>Put your schedules<br><span>on the record.</span></h2>
+    <div class="hero-actions centered">
+      <a class="button primary-action large-action" href="https://github.com/Plicerin/cronlog">Get Cronlog on GitHub <span aria-hidden="true">→</span></a>
+      <a class="button outline-action large-action" href="https://github.com/Plicerin/cronlog/blob/master/RUNBOOK.md">Read the runbook</a>
+    </div>
+  </section>
+
+  <footer>
+    <a href="#top" class="wordmark"><span>cron</span>log</a>
+    <p>Local scheduling. Durable evidence.</p>
+    <div>
+      <a href="https://github.com/Plicerin/cronlog">GitHub</a>
+      <a href="https://github.com/Plicerin/cronlog#readme">README</a>
+      <a href="https://github.com/Plicerin/cronlog/blob/master/RUNBOOK.md">Runbook</a>
+      <a href="https://github.com/Plicerin/cronlog/blob/master/LICENSE">License (MIT)</a>
+    </div>
+  </footer>
+</main>
+<script src="app.js" defer></script>
+</body>
+</html>
