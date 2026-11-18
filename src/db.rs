@@ -312,10 +312,10 @@ impl Database {
     /// A consistent copy of the database at `<path>.before-utc.bak`, or a name with a
     /// timestamp if that is taken. Returns its path.
     ///
-    /// The file is created first, empty, with the database's own permissions (never
-    /// wider), so job commands and captured output are never readable by more users
-    /// than the database is, not even while the copy is written. Creating it also claims
-    /// the name, so an existing backup is never overwritten.
+    /// The file is created first, empty and locked down (see `create_backup_file`), so
+    /// job commands and captured output are never readable by more users than the
+    /// database is, not even while the copy is written. Creating it also claims the
+    /// name, so an existing backup is never overwritten.
     fn backup_before_utc(&self) -> Result<String> {
         let stamp = clock::now().format("%Y%m%d%H%M%S");
         let candidates = std::iter::once(format!("{}.before-utc.bak", self.path)).chain(
@@ -325,7 +325,7 @@ impl Database {
             }),
         );
         for backup in candidates {
-            match create_private_like(&backup, &self.path) {
+            match create_backup_file(&backup, &self.path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => return Err(err.into()),
@@ -1041,19 +1041,105 @@ fn prune_targets(conn: &Connection, keep_last: i64) -> Result<Vec<PruneTarget>> 
     Ok(targets)
 }
 
-/// Create `path`, empty and new, readable and writable by no more users than `like`.
-fn create_private_like(path: &str, like: &str) -> std::io::Result<()> {
+/// Create `path`, empty and new, for a copy of the database at `db`.
+///
+/// - Unix: owner-only (0600). Copying the database's mode is not enough: the new file
+///   takes its folder's group, which may not be the database's.
+/// - Windows: the database's own access list, protected from the folder's inherited
+///   rules, so a database locked down inside a shared folder stays locked down.
+fn create_backup_file(path: &str, db: &str) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mode = std::fs::metadata(like)?.permissions().mode() & 0o666;
-        options.mode(mode);
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    let _ = like; // Windows files inherit their folder's access rules.
-    options.open(path).map(|_| ())
+    drop(options.open(path)?);
+    #[cfg(windows)]
+    if let Err(err) = copy_access_list(db, path) {
+        let _ = std::fs::remove_file(path);
+        return Err(err);
+    }
+    #[cfg(not(windows))]
+    let _ = db;
+    Ok(())
+}
+
+/// Give `to` the access list (DACL) of `from`, and stop it inheriting its folder's.
+#[cfg(windows)]
+fn copy_access_list(from: &str, to: &str) -> std::io::Result<()> {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+
+    const SE_FILE_OBJECT: i32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetNamedSecurityInfoW(
+            object_name: *const u16,
+            object_type: i32,
+            security_info: u32,
+            owner: *mut *mut c_void,
+            group: *mut *mut c_void,
+            dacl: *mut *mut c_void,
+            sacl: *mut *mut c_void,
+            security_descriptor: *mut *mut c_void,
+        ) -> u32;
+        fn SetNamedSecurityInfoW(
+            object_name: *mut u16,
+            object_type: i32,
+            security_info: u32,
+            owner: *mut c_void,
+            group: *mut c_void,
+            dacl: *mut c_void,
+            sacl: *mut c_void,
+        ) -> u32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    let wide = |s: &str| -> Vec<u16> { OsStr::new(s).encode_wide().chain(Some(0)).collect() };
+    let from = wide(from);
+    let mut to = wide(to);
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the names are NUL-terminated UTF-16; the out-pointers are valid, and
+    // `dacl` points into `descriptor`, which is freed only after it is used.
+    unsafe {
+        let err = GetNamedSecurityInfoW(
+            from.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        );
+        if err != 0 {
+            return Err(std::io::Error::from_raw_os_error(err as i32));
+        }
+        let err = SetNamedSecurityInfoW(
+            to.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null_mut(),
+        );
+        LocalFree(descriptor);
+        if err != 0 {
+            return Err(std::io::Error::from_raw_os_error(err as i32));
+        }
+    }
+    Ok(())
 }
 
 /// `PRAGMA user_version` from which job and run times are stored in UTC.
@@ -1589,8 +1675,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&db.path, fs::Permissions::from_mode(0o600)).expect("chmod");
+            // Group-readable: the backup must still be owner-only.
+            fs::set_permissions(&db.path, fs::Permissions::from_mode(0o640)).expect("chmod");
         }
+        #[cfg(windows)]
+        restrict_to_current_user(&db.path);
         let first = format!("{}.before-utc.bak", db.path);
         fs::write(&first, b"an earlier backup").expect("earlier backup");
 
@@ -1614,7 +1703,38 @@ mod tests {
                 let mode = fs::metadata(name).expect("meta").permissions().mode() & 0o777;
                 assert_eq!(mode, 0o600, "{name}");
             }
+            #[cfg(windows)]
+            assert_eq!(access_list(name), access_list(&db.path), "{name}");
         }
+    }
+
+    /// The file's access rules as icacls lists them, without the path.
+    #[cfg(windows)]
+    fn access_list(path: &str) -> Vec<String> {
+        let out = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .expect("icacls");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| line.replacen(path, "", 1).trim().to_string())
+            .filter(|line| line.contains(':') && !line.starts_with("Successfully"))
+            .collect()
+    }
+
+    /// Drop the file's inherited rules and allow only the current user.
+    #[cfg(windows)]
+    fn restrict_to_current_user(path: &str) {
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r", &format!("{user}:F")])
+            .output()
+            .expect("icacls")
+            .status;
+        assert!(status.success());
+        let rules = access_list(path);
+        assert_eq!(rules.len(), 1, "{rules:?}");
     }
 
     #[test]
