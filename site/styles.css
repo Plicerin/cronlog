@@ -193,10 +193,17 @@ pre { margin: 0; }
 .product-frame .view + .view { border-top: 1px solid #292929; }
 .product-steps { display: none; }
 .js .product-frame { height: min(52vh, 480px); }
-.js .product-frame .view { display: none; border-top: 0; }
+.js .product-frame { position: relative; }
+.js .product-frame .view { border-top: 0; }
+/* Views not in focus are hidden on screen only, so screen readers still read all three. */
+.js .product-frame:not([data-angle="0"]) .view-0,
+.js .product-frame:not([data-angle="1"]) .view-1,
+.js .product-frame:not([data-angle="2"]) .view-2 {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%);
+}
 .js .product-frame[data-angle="0"] .view-0,
 .js .product-frame[data-angle="1"] .view-1,
-.js .product-frame[data-angle="2"] .view-2 { display: block; animation: fade-in .45s ease; }
+.js .product-frame[data-angle="2"] .view-2 { animation: fade-in .45s ease; }
 @keyframes fade-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .js .product-steps { display: flex; gap: 26px; margin-top: 20px; font: 11px var(--mono); color: #8a8a87; }
 .product-steps .is-active { color: var(--accent-text); }
