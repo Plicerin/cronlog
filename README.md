@@ -25,6 +25,7 @@ cargo run -- add --name heartbeat --schedule "every 10 seconds" -- echo alive
 cargo run -- add --name pilot --schedule "every 1 hours" --max-runs 12 -- ./pipeline.sh
 cargo run -- list
 cargo run -- status
+cargo run -- health
 cargo run -- daemon
 cargo run -- history heartbeat
 cargo run -- logs heartbeat --last
@@ -77,6 +78,33 @@ cronlog add --name pilot --schedule "every 1 hours" --max-runs 12 -- ./pipeline.
 - Bounded runs: optional `--max-runs N`; scheduled runs that actually start count, manual runs and overlap skips do not
 - History retention: once a day the daemon deletes runs (and their logs) scheduled more than 30 days ago. It works one bounded step per tick (500 runs, then about 4 MB of freed space at a time), so jobs never wait long to record results. It always keeps each job's newest 20 runs, every `running` run, and, for a job with `--max-runs`, the runs that count toward its limit. Change it with `daemon --retain 90d --keep-last 50`, or keep everything with `--retain forever`
 - Database size: new databases use SQLite's incremental auto-vacuum, so pruning shrinks the file. A database created by an older Cronlog reuses the freed space but does not shrink until you run `cronlog prune --vacuum` once (it rewrites the file and locks it while it runs; stop the daemon first if the file is large)
+
+## Health checks
+
+`cronlog health` exits 0 when all is well and 1 when it is not, listing each problem, so a watchdog or monitor can act on the exit code alone:
+
+```bash
+cronlog health                       # the daemon and every enabled job
+cronlog health --job pipeline-status # the daemon and one job
+cronlog --json health                # the report as JSON, whatever the result
+```
+
+It reports:
+
+- `daemon_missing`: no daemon has ever run against this database (or only one older than `health`)
+- `daemon_stale`: the daemon checks in every 30 seconds and has not for `--daemon-stale` (default 2m) plus its poll interval
+- `overdue`: a job's run is more than `--grace` (default 5m) late and not started
+- `failing`: a job's last `--failures` (default 3) finished runs all failed, timed out or were interrupted. Skipped runs are not counted
+- `stuck`: a run is still `running` more than a minute after its timeout
+- `disabled`: the job named with `--job` is disabled. Without `--job`, disabled jobs are not checked
+
+Example:
+
+```text
+UNHEALTHY: 2 problems
+- daemon (pid 4242) last seen 11m 3s ago, at 2026-11-17 22:15:18 -05:00 (daemon_stale)
+- sync: last 3 runs failed; newest, run #81, failed at 2026-11-17 22:10:00 -05:00, exit code 1 (failing)
+```
 
 ## Times and daylight saving
 

@@ -332,7 +332,16 @@ systemctl is-active cronlog
 journalctl -u cronlog -n 100 --no-pager
 ```
 
-Basic job health:
+One check for the daemon and every job, for a watchdog, cron or monitoring system. It exits 1 and lists the problems when something is wrong (see README.md, Health checks):
+
+```bash
+cronlog --db "$CRONLOG_DB" health || alert "cronlog: $(cronlog --db "$CRONLOG_DB" health)"
+cronlog --db "$CRONLOG_DB" --json health --job important-job
+```
+
+A daemon from before `health` writes no heartbeat, so `health` reports `daemon_missing` until the daemon is upgraded and restarted.
+
+Detailed job state:
 
 ```bash
 cronlog --db "$CRONLOG_DB" --json status

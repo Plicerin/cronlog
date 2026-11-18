@@ -2,6 +2,7 @@ mod cli;
 mod clock;
 mod db;
 mod error;
+mod health;
 mod runner;
 mod schedule;
 mod scheduler;
@@ -67,6 +68,28 @@ fn main() -> Result<()> {
                 ui::print_json(&rows)?;
             } else {
                 ui::print_status(&rows);
+            }
+        }
+        Commands::Health {
+            job,
+            grace,
+            failures,
+            daemon_stale,
+        } => {
+            let options = health::HealthOptions {
+                job,
+                grace: to_chrono(grace),
+                failures,
+                daemon_stale: to_chrono(daemon_stale),
+            };
+            let report = health::check(&db, clock::now(), &options)?;
+            if json {
+                ui::print_json(&report)?;
+            } else {
+                health::print(&report);
+            }
+            if !report.healthy {
+                std::process::exit(1);
             }
         }
         Commands::Daemon {

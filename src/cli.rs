@@ -116,6 +116,28 @@ pub enum Commands {
         name: Option<String>,
     },
 
+    /// Check that the daemon is alive and every job is on time and succeeding. Exits 1
+    /// and lists the problems if not; with --json, prints the report either way
+    Health {
+        /// Check only this job (and the daemon); a disabled job named here is a problem
+        #[arg(long)]
+        job: Option<String>,
+
+        /// A job whose run is this late and not started is overdue
+        #[arg(long, default_value = "5m", value_parser = parse_duration)]
+        grace: Duration,
+
+        /// A job whose last N finished runs all failed, timed out or were interrupted is
+        /// failing (skipped runs are not counted)
+        #[arg(long, default_value_t = 3, value_parser = parse_positive_i64)]
+        failures: i64,
+
+        /// The daemon is down when not seen for this long (it checks in every 30s), plus
+        /// its poll interval
+        #[arg(long, default_value = "2m", value_parser = parse_duration)]
+        daemon_stale: Duration,
+    },
+
     /// Run the scheduler loop in the foreground
     Daemon {
         /// Poll interval in seconds

@@ -1,4 +1,6 @@
-use crate::db::{Database, HistoryRow, Job, PruneReport, RunClaim, RunResult, RECLAIM_CHUNK_PAGES};
+use crate::db::{
+    Database, Heartbeat, HistoryRow, Job, PruneReport, RunClaim, RunResult, RECLAIM_CHUNK_PAGES,
+};
 use crate::error::Result;
 use crate::{clock, runner, schedule};
 use std::panic::{self, AssertUnwindSafe};
@@ -126,14 +128,54 @@ impl Pruner {
     }
 }
 
+/// How often the daemon records that it is alive, for `cronlog health`.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
+
+/// Writes the daemon's heartbeat at most every HEARTBEAT_EVERY. A failed write is
+/// reported and retried next tick; it never stops the daemon.
+struct HeartbeatWriter {
+    heartbeat: Heartbeat,
+    last_written: Option<Instant>,
+}
+
+impl HeartbeatWriter {
+    fn new(started_at: chrono::NaiveDateTime, poll_seconds: u64) -> Self {
+        Self {
+            heartbeat: Heartbeat {
+                pid: i64::from(std::process::id()),
+                started_at,
+                last_tick: started_at,
+                poll_seconds: i64::try_from(poll_seconds).unwrap_or(i64::MAX),
+            },
+            last_written: None,
+        }
+    }
+
+    fn tick(&mut self, db: &Database, now: chrono::NaiveDateTime) {
+        if self
+            .last_written
+            .is_some_and(|last| last.elapsed() < HEARTBEAT_EVERY)
+        {
+            return;
+        }
+        self.heartbeat.last_tick = now;
+        match db.record_heartbeat(&self.heartbeat) {
+            Ok(()) => self.last_written = Some(Instant::now()),
+            Err(err) => eprintln!("Could not record the daemon heartbeat: {err}"),
+        }
+    }
+}
+
 pub fn run_daemon(db: &Database, poll_seconds: u64, retention: Option<Retention>) -> Result<()> {
     recover_interrupted_runs(db)?;
     let orphans = Orphans::default();
     let mut pruner = retention.map(Pruner::new);
+    let mut heartbeat = HeartbeatWriter::new(clock::now(), poll_seconds.max(1));
 
     loop {
         recover_orphaned_runs(db, &orphans);
         let now = clock::now();
+        heartbeat.tick(db, now);
         // Handles are dropped: runs finish on their own threads and record their own results.
         dispatch_due_jobs(db, now, &orphans)?;
         if let Some(pruner) = pruner.as_mut() {
@@ -974,5 +1016,31 @@ mod tests {
         recover_orphaned_runs(&db, &orphans);
         assert!(orphans.lock().unwrap().is_empty());
         assert_eq!(last_status(&db, "quick"), "success");
+    }
+
+    #[test]
+    fn the_daemon_heartbeat_is_written_at_start_then_every_30_seconds() {
+        let db = test_db();
+        assert!(db.heartbeat().expect("read").is_none());
+        let mut writer = HeartbeatWriter::new(at(12, 0, 0), 1);
+        writer.tick(&db, at(12, 0, 0));
+        let seen = db.heartbeat().expect("read").expect("written");
+        assert_eq!(seen.pid, i64::from(std::process::id()));
+        assert_eq!(seen.last_tick, at(12, 0, 0));
+        assert_eq!(seen.poll_seconds, 1);
+
+        // The next tick, within 30 seconds, writes nothing.
+        writer.tick(&db, at(12, 0, 1));
+        assert_eq!(
+            db.heartbeat().expect("read").unwrap().last_tick,
+            at(12, 0, 0)
+        );
+
+        // Once 30 seconds have passed it writes again.
+        writer.last_written = Some(Instant::now() - HEARTBEAT_EVERY);
+        writer.tick(&db, at(12, 0, 30));
+        let seen = db.heartbeat().expect("read").unwrap();
+        assert_eq!(seen.last_tick, at(12, 0, 30));
+        assert_eq!(seen.started_at, at(12, 0, 0));
     }
 }
