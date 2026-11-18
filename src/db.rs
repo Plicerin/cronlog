@@ -218,6 +218,9 @@ pub struct PruneReport {
 
 /// One job's runs old enough to delete: job ?1, scheduled before the cutoff ?2, and older
 /// than the job's keep-last boundary run (?3 scheduled_for, ?4 id). Never a `running` run.
+/// Never a run whose hook is queued or running (its alert must still be sent), nor the
+/// run of the job's latest finished hook, which `cronlog health` reads: pruning must not
+/// clear `hook_failing` when no hook has succeeded since.
 ///
 /// Age is `scheduled_for`, the one timestamp every run has (an overlap skip has no
 /// `started_at`). Each query is a range scan on an index whose rows are nearly all
@@ -227,7 +230,11 @@ const PRUNABLE_FOR_JOB: &str = "FROM runs INDEXED BY idx_runs_job_scheduled
     WHERE job_id = ?1 AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
       AND status <> 'running'
       AND NOT EXISTS (SELECT 1 FROM hook_runs h WHERE h.run_id = runs.id
-                      AND h.status IN ('pending', 'running'))";
+                      AND (h.status IN ('pending', 'running')
+                           OR h.id = (SELECT l.id FROM hook_runs l
+                                      WHERE l.job_id = h.job_id
+                                        AND l.status NOT IN ('pending', 'running', 'skipped')
+                                      ORDER BY l.finished_at DESC, l.id DESC LIMIT 1)))";
 
 /// For a live job with `--max-runs`: its limit is enforced by counting its scheduled,
 /// started runs, so only its overlap skips and its manual runs may go. Separate indexed
@@ -237,13 +244,21 @@ const PRUNABLE_SKIPS_FOR_BOUNDED_JOB: &str = "FROM runs INDEXED BY idx_runs_job_
     WHERE job_id = ?1 AND trigger_type = 'schedule' AND status = 'skipped'
       AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
       AND NOT EXISTS (SELECT 1 FROM hook_runs h WHERE h.run_id = runs.id
-                      AND h.status IN ('pending', 'running'))";
+                      AND (h.status IN ('pending', 'running')
+                           OR h.id = (SELECT l.id FROM hook_runs l
+                                      WHERE l.job_id = h.job_id
+                                        AND l.status NOT IN ('pending', 'running', 'skipped')
+                                      ORDER BY l.finished_at DESC, l.id DESC LIMIT 1)))";
 const PRUNABLE_MANUAL_FOR_BOUNDED_JOB: &str = "FROM runs INDEXED BY idx_runs_job_trigger_status
     WHERE job_id = ?1 AND trigger_type = 'manual'
       AND status IN ('success', 'failed', 'timed_out', 'interrupted', 'skipped')
       AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
       AND NOT EXISTS (SELECT 1 FROM hook_runs h WHERE h.run_id = runs.id
-                      AND h.status IN ('pending', 'running'))";
+                      AND (h.status IN ('pending', 'running')
+                           OR h.id = (SELECT l.id FROM hook_runs l
+                                      WHERE l.job_id = h.job_id
+                                        AND l.status NOT IN ('pending', 'running', 'skipped')
+                                      ORDER BY l.finished_at DESC, l.id DESC LIMIT 1)))";
 
 /// The prunable-run filters for one job.
 fn prunable_filters(protect_counted: bool) -> &'static [&'static str] {

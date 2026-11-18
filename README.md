@@ -128,9 +128,9 @@ When they run:
 - `recovery`: a job's first success after one or more failures
 - Skipped runs never trigger a hook, and manual runs count like scheduled ones
 
-Each hook is queued in the same transaction that records the run, then run by the daemon within a poll interval, or straight after `cronlog run --now`. A hook still queued when Cronlog stops runs the next time it starts, so alerts are not lost to a restart. One cut off while running (a crash or reboot mid-hook) is not retried, since it may already have sent its alert: it is recorded as `interrupted` and `cronlog health` reports it. Pruning keeps a run until its hook has run. Runs interrupted by a daemon restart count as failures, so a reboot that kills a job alerts too.
+Each hook is queued in the same transaction that records the run, then run by the daemon within a poll interval, or straight after `cronlog run --now`. A hook still queued when Cronlog stops runs the next time it starts, so alerts are not lost to a restart. One cut off while running (a crash or reboot mid-hook) is not retried, since it may already have sent its alert: it is recorded as `interrupted` and `cronlog health` reports it. Pruning keeps a run until its hook has run, and keeps each job's latest hook result, so it can't clear `hook_failing`. Runs interrupted by a daemon restart count as failures, so a reboot that kills a job alerts too.
 
-The command runs without a shell, like a job, with no stdin, its stdout discarded and its stderr kept if it fails. It is killed after 30 seconds. It gets:
+The command runs without a shell, like a job, with no stdin, its stdout discarded and its stderr kept if it fails. It is killed after 30 seconds. It gets these variables, and none it would otherwise inherit from a job or hook that started Cronlog:
 
 | Variable | Value |
 |---|---|

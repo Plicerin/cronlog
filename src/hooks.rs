@@ -26,6 +26,24 @@ const STDERR_TAIL_BYTES: usize = 2000;
 /// How much of a failed hook's own error output is kept.
 const ERROR_BYTES: usize = 500;
 
+/// The variables Cronlog sets for jobs and hooks, removed from what a hook inherits.
+const INHERITED_VARS: [&str; 14] = [
+    "CRONLOG_EVENT",
+    "CRONLOG_JOB_NAME",
+    "CRONLOG_RUN_ID",
+    "CRONLOG_FAILURE_STREAK",
+    "CRONLOG_STATUS",
+    "CRONLOG_EXIT_CODE",
+    "CRONLOG_ERROR",
+    "CRONLOG_FINISHED_AT",
+    "CRONLOG_STDERR_TAIL",
+    "CRONLOG_TEST",
+    "CRONLOG_SCHEDULED_FOR",
+    "CRONLOG_TRIGGER_TYPE",
+    "CRONLOG_PREVIOUS_RUN_ID",
+    "CRONLOG_PREVIOUS_STATUS",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum HookEvent {
     /// The job's first failure after a success
@@ -85,20 +103,7 @@ pub fn execute(command: &[String], env: &[(&str, String)], timeout: Duration) ->
     let Some((program, args)) = command.split_first() else {
         return failed("hook command is empty".into(), None, 0);
     };
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let mut child = match cmd.spawn() {
+    let mut child = match build_command(program, args, env).spawn() {
         Ok(child) => child,
         Err(e) => return failed(format!("could not start hook: {e}"), None, elapsed()),
     };
@@ -164,6 +169,28 @@ pub fn execute(command: &[String], env: &[(&str, String)], timeout: Duration) ->
     }
 }
 
+fn build_command(program: &str, args: &[String], env: &[(&str, String)]) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // Cronlog run from a job or another hook inherits that one's variables; a hook gets
+    // only those describing its own run, so a stale error or CRONLOG_TEST can't leak in.
+    for key in INHERITED_VARS {
+        cmd.env_remove(key);
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd
+}
+
 /// The end of `text`, at most `max` bytes, cut on a character boundary.
 fn last_bytes(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -211,10 +238,9 @@ fn env_for(hook: &PendingHook) -> Vec<(&'static str, String)> {
     env
 }
 
-/// Run every queued hook, oldest first, and record how each went. Returns how many
-/// were taken from the queue.
-/// Run queued hooks, oldest first: all of them, or only those of `run_id` (a manual run
-/// sends its own alert and leaves any backlog to the daemon).
+/// Run queued hooks, oldest first, and record how each went: all of them, or only those
+/// of `run_id` (a manual run sends its own alert and leaves any backlog to the daemon).
+/// Returns how many were taken from the queue.
 pub fn dispatch_pending(db: &Database, run_id: Option<i64>) -> Result<usize> {
     let mut taken = 0;
     while let Some(hook) = db.claim_pending_hook(clock::now(), run_id)? {
@@ -654,26 +680,59 @@ mod tests {
     }
 
     #[test]
-    fn pruning_keeps_a_run_until_its_hook_has_run_then_removes_both() {
+    fn pruning_keeps_queued_hooks_and_the_latest_outcome() {
         let db = test_db();
         db.set_hook_command(HOOK_FAILURE, Some("notify")).unwrap();
+        let later = clock::now() + chrono::Duration::days(1);
+        let finish = |db: &Database, status: &str| {
+            let hook = db
+                .claim_pending_hook(clock::now(), None)
+                .unwrap()
+                .expect("hook");
+            db.finish_hook(hook.id, status, clock::now(), 5, None, None)
+                .unwrap();
+        };
         finished_run(&db, "sync", "failed", Some(1), "");
         finished_run(&db, "sync", "success", Some(0), "");
-        let later = clock::now() + chrono::Duration::days(1);
+        // keep-last 1 would take the failed run, but its alert is still queued.
         assert_eq!(db.count_prunable(later, 1).unwrap(), 0);
-        db.prune_batch(later, 1, 100).unwrap();
-        assert_eq!(db.hook_history(10).unwrap().len(), 1, "queued alert kept");
 
-        let hook = db
-            .claim_pending_hook(clock::now(), None)
-            .unwrap()
-            .expect("hook");
-        db.finish_hook(hook.id, "success", clock::now(), 5, Some(0), None)
-            .unwrap();
-        assert_eq!(db.count_prunable(later, 1).unwrap(), 1);
+        // Once it has failed, it's the job's latest outcome: kept, so health still says so.
+        finish(&db, "failed");
         db.prune_batch(later, 1, 100).unwrap();
-        assert!(db.hook_history(10).unwrap().is_empty());
+        let latest = db.last_finished_hook(Some("sync")).unwrap().expect("kept");
+        assert_eq!(latest.status, "failed");
+
+        // A newer hook outcome frees it.
+        finished_run(&db, "sync", "failed", Some(1), "");
+        finish(&db, "success");
+        assert_eq!(
+            db.count_prunable(later, 1).unwrap(),
+            2,
+            "the first two runs"
+        );
+        db.prune_batch(later, 1, 100).unwrap();
+        let history = db.hook_history(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "success");
         remove(db);
+    }
+
+    #[test]
+    fn a_hook_does_not_inherit_cronlog_variables_it_was_not_given() {
+        let env = [("CRONLOG_EVENT", "recovery".to_string())];
+        let cmd = build_command("notify", &[], &env);
+        let envs: Vec<_> = cmd.get_envs().collect();
+        for key in ["CRONLOG_TEST", "CRONLOG_ERROR", "CRONLOG_STDERR_TAIL"] {
+            assert!(
+                envs.contains(&(std::ffi::OsStr::new(key), None)),
+                "{key} not removed"
+            );
+        }
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("CRONLOG_EVENT"),
+            Some(std::ffi::OsStr::new("recovery"))
+        )));
     }
 
     #[test]
