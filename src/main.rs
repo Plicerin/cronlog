@@ -14,8 +14,14 @@ use cli::{Cli, Commands};
 use db::Database;
 use error::Result;
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn main() {
+    if let Err(e) = run(Cli::parse()) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     let db = Database::open(&cli.db)?;
     db.init()?;
     let json = cli.json;
@@ -190,9 +196,13 @@ fn main() -> Result<()> {
                 ui::print_logs(rid, &logs);
             }
         }
-        Commands::Run { name, now: _ } => {
+        Commands::Run {
+            name,
+            now: _,
+            force,
+        } => {
             let job = db.get_job_by_name(&name)?;
-            scheduler::run_job_once(&db, &job, clock::now(), "manual")?;
+            scheduler::run_manual(&db, &job, clock::now(), force)?;
         }
         Commands::Enable { name } => {
             let next = scheduler::enable_job(&db, &name, clock::now())?;

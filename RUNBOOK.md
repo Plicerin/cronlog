@@ -205,7 +205,7 @@ cronlog --db "$CRONLOG_DB" add \
 Do a side-by-side pilot first:
 
 1. Add the Cronlog job.
-2. Run it manually with `cronlog run <name> --now`.
+2. Run it manually with `cronlog run <name> --now`. If the job is already running, scheduled or by hand, this refuses with an error and exit code 1; add `--force` only if two copies at once are safe for that job.
 3. Check `status`, `history`, and `logs`.
 4. Disable the old crontab line only after Cronlog output matches expectations.
 
