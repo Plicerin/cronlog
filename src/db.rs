@@ -52,6 +52,14 @@ pub struct InterruptedRun {
     pub job_name: String,
 }
 
+/// The result of asking to start a manual run.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManualClaim {
+    Started(i64),
+    /// The job already has a run in progress: its id and start time.
+    Busy(i64, Option<NaiveDateTime>),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunClaim {
     Claimed(i64),
@@ -710,6 +718,43 @@ impl Database {
         Ok(claim)
     }
 
+    /// Start a manual run, unless the job already has one in progress. The check and
+    /// the insert share one transaction, so the daemon can't start a run in between.
+    /// `force` starts it regardless.
+    pub fn claim_manual_run(
+        &self,
+        job_id: i64,
+        scheduled_for: NaiveDateTime,
+        started_at: NaiveDateTime,
+        force: bool,
+    ) -> Result<ManualClaim> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !force {
+            let active = tx
+                .query_row(
+                    "SELECT id, started_at FROM runs WHERE job_id = ?1 AND status = 'running' ORDER BY id LIMIT 1",
+                    params![job_id],
+                    |r| Ok((r.get::<_, i64>(0)?, parse_dt_opt(r.get(1)?))),
+                )
+                .optional()?;
+            if let Some((run_id, started)) = active {
+                tx.commit()?;
+                return Ok(ManualClaim::Busy(run_id, started));
+            }
+        }
+        tx.execute(
+            "INSERT INTO runs (job_id, status, scheduled_for, started_at, trigger_type)
+             VALUES (?1, 'running', ?2, ?3, 'manual')",
+            params![job_id, scheduled_for.to_string(), started_at.to_string()],
+        )?;
+        let run_id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(ManualClaim::Started(run_id))
+    }
+
+    /// Insert a run directly, for setting up test state.
+    #[cfg(test)]
     pub fn create_run(
         &self,
         job_id: i64,
@@ -1584,6 +1629,89 @@ mod tests {
                 .expect("stale claim"),
             RunClaim::NotDue
         );
+
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn claim_manual_run_refuses_while_a_run_is_active() {
+        let db = test_db();
+        let when = fixed_time();
+        db.add_job(
+            "dispatcher",
+            &["echo".into(), "hi".into()],
+            "every 1 minutes",
+            3600,
+            None,
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("dispatcher").expect("get job");
+
+        // Nothing running: it starts.
+        let ManualClaim::Started(first) = db
+            .claim_manual_run(job.id, when, when, false)
+            .expect("first claim")
+        else {
+            panic!("expected the first manual run to start");
+        };
+
+        // That run is still going: a second is refused and nothing is recorded.
+        assert_eq!(
+            db.claim_manual_run(job.id, when, when, false)
+                .expect("second claim"),
+            ManualClaim::Busy(first, Some(when))
+        );
+        assert_eq!(db.history("dispatcher", 10).expect("history").len(), 1);
+
+        // --force starts another copy anyway.
+        let forced = db
+            .claim_manual_run(job.id, when, when, true)
+            .expect("forced claim");
+        assert!(matches!(forced, ManualClaim::Started(id) if id != first));
+
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn claim_manual_run_waits_for_a_scheduled_run_too() {
+        let db = test_db();
+        let when = fixed_time();
+        db.add_job(
+            "sync",
+            &["echo".into(), "hi".into()],
+            "every 15 minutes",
+            3600,
+            None,
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("sync").expect("get job");
+        let scheduled = db
+            .create_run(job.id, "running", when, Some(when), "schedule")
+            .expect("scheduled run");
+
+        assert_eq!(
+            db.claim_manual_run(job.id, when, when, false)
+                .expect("claim"),
+            ManualClaim::Busy(scheduled, Some(when))
+        );
+
+        // Once it finishes, a manual run starts.
+        db.create_run(job.id, "success", when, Some(when), "schedule")
+            .expect("unrelated finished run");
+        let conn = db.conn().expect("conn");
+        conn.execute(
+            "UPDATE runs SET status = 'success' WHERE id = ?1",
+            params![scheduled],
+        )
+        .expect("finish scheduled run");
+        drop(conn);
+        assert!(matches!(
+            db.claim_manual_run(job.id, when, when, false)
+                .expect("claim after"),
+            ManualClaim::Started(_)
+        ));
 
         let _ = fs::remove_file(db.path);
     }

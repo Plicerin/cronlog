@@ -21,4 +21,7 @@ pub enum CronlogError {
 
     #[error("not found: {0}")]
     NotFound(String),
+
+    #[error("{0}")]
+    AlreadyRunning(String),
 }

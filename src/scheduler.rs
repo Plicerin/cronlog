@@ -1,7 +1,8 @@
 use crate::db::{
-    Database, Heartbeat, HistoryRow, Job, PruneReport, RunClaim, RunResult, RECLAIM_CHUNK_PAGES,
+    Database, Heartbeat, HistoryRow, Job, ManualClaim, PruneReport, RunClaim, RunResult,
+    RECLAIM_CHUNK_PAGES,
 };
-use crate::error::Result;
+use crate::error::{CronlogError, Result};
 use crate::{clock, runner, schedule};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
@@ -287,21 +288,30 @@ fn recover_interrupted_runs(db: &Database) -> Result<()> {
     Ok(())
 }
 
-pub fn run_job_once(
+/// Run a job now, by hand. Refuses while the job already has a run in progress,
+/// scheduled or manual, unless `force` is set.
+pub fn run_manual(
     db: &Database,
     job: &Job,
     scheduled_for: chrono::NaiveDateTime,
-    trigger_type: &str,
+    force: bool,
 ) -> Result<()> {
+    let trigger_type = "manual";
     let previous = db.history(&job.name, 1)?.into_iter().next();
     let started_at = clock::now();
-    let run_id = db.create_run(
-        job.id,
-        "running",
-        scheduled_for,
-        Some(started_at),
-        trigger_type,
-    )?;
+    let run_id = match db.claim_manual_run(job.id, scheduled_for, started_at, force)? {
+        ManualClaim::Started(run_id) => run_id,
+        ManualClaim::Busy(active, started) => {
+            let since = started
+                .map(|t| format!(", started {}", clock::display(t)))
+                .unwrap_or_default();
+            return Err(CronlogError::AlreadyRunning(format!(
+                "job '{}' is already running (run #{active}{since}); \
+                 use --force to start another copy",
+                job.name
+            )));
+        }
+    };
     println!(
         "Starting job '{}' run #{}: {}",
         job.name,

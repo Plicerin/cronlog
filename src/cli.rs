@@ -212,6 +212,10 @@ pub enum Commands {
         /// Explicitly run now
         #[arg(long)]
         now: bool,
+
+        /// Start even if the job already has a run in progress
+        #[arg(long)]
+        force: bool,
     },
 
     /// Enable a job
