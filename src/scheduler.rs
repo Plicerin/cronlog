@@ -1,7 +1,6 @@
 use crate::db::{Database, HistoryRow, Job, PruneReport, RunClaim, RunResult, RECLAIM_CHUNK_PAGES};
 use crate::error::Result;
-use crate::{runner, schedule};
-use chrono::Local;
+use crate::{clock, runner, schedule};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -101,8 +100,10 @@ impl Pruner {
                 }
                 if self.pass.runs > 0 {
                     println!(
-                        "Pruned {} runs scheduled before {cutoff} (kept each job's newest {})",
-                        self.pass.runs, self.retention.keep_last
+                        "Pruned {} runs scheduled before {} (kept each job's newest {})",
+                        self.pass.runs,
+                        clock::display(cutoff),
+                        self.retention.keep_last
                     );
                 }
                 // Reclaim even when nothing was deleted this pass: pages freed before a
@@ -132,7 +133,7 @@ pub fn run_daemon(db: &Database, poll_seconds: u64, retention: Option<Retention>
 
     loop {
         recover_orphaned_runs(db, &orphans);
-        let now = Local::now().naive_local();
+        let now = clock::now();
         // Handles are dropped: runs finish on their own threads and record their own results.
         dispatch_due_jobs(db, now, &orphans)?;
         if let Some(pruner) = pruner.as_mut() {
@@ -157,7 +158,7 @@ pub fn dispatch_due_jobs(
         let scheduled_for = job.next_run_at.unwrap_or(now);
         let next_run_at = next_run_after_scheduled_time(&job, scheduled_for, now)?;
 
-        match db.claim_scheduled_run(job.id, scheduled_for, next_run_at, runner::now())? {
+        match db.claim_scheduled_run(job.id, scheduled_for, next_run_at, clock::now())? {
             RunClaim::Claimed(run_id) => {
                 let db = db.clone();
                 let orphans = Arc::clone(orphans);
@@ -217,7 +218,7 @@ pub fn recover_orphaned_runs(db: &Database, orphans: &Orphans) {
     let mut still_pending = Vec::new();
     for (run_id, reason) in pending {
         let message = format!("cronlog could not record this run: {reason}");
-        match db.interrupt_run(run_id, runner::now(), &message) {
+        match db.interrupt_run(run_id, clock::now(), &message) {
             Ok(true) => println!("Marked run #{run_id} as interrupted: {message}"),
             Ok(false) => {} // it was recorded after all
             Err(err) => {
@@ -234,7 +235,7 @@ pub fn recover_orphaned_runs(db: &Database, orphans: &Orphans) {
 
 fn recover_interrupted_runs(db: &Database) -> Result<()> {
     let message = "daemon restarted while run was active";
-    let interrupted = db.interrupt_stale_running_runs(runner::now(), message)?;
+    let interrupted = db.interrupt_stale_running_runs(clock::now(), message)?;
     for run in interrupted {
         println!(
             "Marked job '{}' run #{} as interrupted: {}",
@@ -251,7 +252,7 @@ pub fn run_job_once(
     trigger_type: &str,
 ) -> Result<()> {
     let previous = db.history(&job.name, 1)?.into_iter().next();
-    let started_at = runner::now();
+    let started_at = clock::now();
     let run_id = db.create_run(
         job.id,
         "running",
@@ -301,7 +302,8 @@ fn execute_claimed_run(
     let context = runner::ExecuteContext {
         run_id,
         job_name: job.name.clone(),
-        scheduled_for: scheduled_for.to_string(),
+        // Local wall-clock time, as before times were stored in UTC.
+        scheduled_for: clock::to_local(scheduled_for).naive_local().to_string(),
         trigger_type: trigger_type.to_string(),
         previous_run_id: previous.as_ref().map(|row| row.run_id),
         previous_status: previous.as_ref().map(|row| row.status.clone()),
@@ -313,7 +315,7 @@ fn execute_claimed_run(
                 run_id,
                 &RunResult {
                     status: &out.status,
-                    finished_at: runner::now(),
+                    finished_at: clock::now(),
                     duration_ms: out.duration_ms,
                     exit_code: out.exit_code,
                     error: out.error.as_deref(),
@@ -335,7 +337,7 @@ fn execute_claimed_run(
                 run_id,
                 &RunResult {
                     status: "failed",
-                    finished_at: runner::now(),
+                    finished_at: clock::now(),
                     duration_ms: 0,
                     exit_code: None,
                     error: Some(&message),
@@ -381,7 +383,7 @@ fn first_slot_after(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use chrono::{Local, NaiveDate};
 
     fn job(schedule: &str) -> Job {
         Job {
@@ -648,6 +650,38 @@ mod tests {
         );
     }
 
+    /// The bug this guards against: times were local wall-clock time, so when New York
+    /// fell back from 02:00 to 01:00 on 2026-11-01 an every-5-minutes job due at "02:00"
+    /// sat idle for 65 minutes. Replay that night one real minute at a time.
+    #[test]
+    fn an_interval_job_keeps_running_through_the_fall_back_hour() {
+        let db = test_db();
+        let start = NaiveDate::from_ymd_opt(2026, 11, 1)
+            .unwrap()
+            .and_hms_opt(5, 30, 0)
+            .unwrap(); // 01:30 EDT
+        db.add_job("tick", &quick_command(), "every 5 minutes", 60, None, start)
+            .expect("add");
+        let orphans = Orphans::default();
+        let mut ran = Vec::new();
+        for minute in 0..=120 {
+            let now = start + chrono::Duration::minutes(minute);
+            let handles = dispatch_due_jobs(&db, now, &orphans).expect("dispatch");
+            if !handles.is_empty() {
+                ran.push(now);
+            }
+            for handle in handles {
+                handle.join().expect("worker");
+            }
+        }
+        let gaps: Vec<i64> = ran
+            .windows(2)
+            .map(|w| (w[1] - w[0]).num_minutes())
+            .collect();
+        assert_eq!(ran.len(), 25, "gaps (min): {gaps:?}");
+        assert!(gaps.iter().all(|gap| *gap == 5), "gaps (min): {gaps:?}");
+    }
+
     #[test]
     fn the_daemon_reclaims_pages_left_from_an_earlier_pass() {
         let db = test_db();
@@ -748,7 +782,7 @@ mod tests {
     #[test]
     fn a_slow_job_does_not_delay_other_jobs() {
         let db = test_db();
-        let now = Local::now().naive_local();
+        let now = clock::now();
         db.add_job("slow", &slow_command(), "every 1 hours", 60, None, now)
             .expect("add slow");
         db.add_job("quick", &quick_command(), "every 1 hours", 60, None, now)
@@ -769,7 +803,7 @@ mod tests {
     #[test]
     fn a_job_still_running_at_its_next_slot_is_recorded_as_skipped() {
         let db = test_db();
-        let now = Local::now().naive_local();
+        let now = clock::now();
         db.add_job("slow", &slow_command(), "every 1 seconds", 60, None, now)
             .expect("add slow");
 
@@ -792,7 +826,7 @@ mod tests {
     #[test]
     fn a_run_its_worker_could_not_record_is_interrupted_and_the_job_unblocked() {
         let db = test_db();
-        let now = Local::now().naive_local();
+        let now = clock::now();
         db.add_job("quick", &quick_command(), "every 1 seconds", 60, None, now)
             .expect("add quick");
         let job = db.get_job_by_name("quick").expect("job");
@@ -832,41 +866,44 @@ mod tests {
         assert_eq!(last_status(&db, "quick"), "success");
     }
 
+    /// `at` on this machine's clock, as the UTC time Cronlog stores. A daily schedule
+    /// reads its time of day in the local zone.
+    fn local_at(day: u32, hour: u32, minute: u32) -> chrono::NaiveDateTime {
+        let local = NaiveDate::from_ymd_opt(2026, 6, day)
+            .expect("valid date")
+            .and_hms_opt(hour, minute, 0)
+            .expect("valid time");
+        clock::local_to_utc(&Local, local)
+    }
+
     #[test]
     fn enabling_a_job_whose_slot_passed_waits_for_the_next_slot() {
         let db = test_db();
-        let added = at(6, 0, 0);
+        let seven = local_at(14, 7, 0);
         db.add_job(
             "digest",
             &quick_command(),
             "daily at 07:00",
             60,
             None,
-            at(7, 0, 0),
+            seven,
         )
         .expect("add");
         db.set_enabled("digest", false).expect("disable");
 
         // Enabled at 13:00, after today's 07:00 passed: tomorrow 07:00, not now.
-        let afternoon = at(13, 0, 0);
+        let afternoon = local_at(14, 13, 0);
         let next = enable_job(&db, "digest", afternoon).expect("enable");
-        assert_eq!(next, at(7, 0, 0) + chrono::Duration::days(1));
+        assert_eq!(next, local_at(15, 7, 0));
         assert!(db.get_due_jobs(afternoon).expect("due").is_empty());
 
         // Enabled before its slot: the slot is kept.
-        db.add_job(
-            "early",
-            &quick_command(),
-            "daily at 07:00",
-            60,
-            None,
-            at(7, 0, 0),
-        )
-        .expect("add");
+        db.add_job("early", &quick_command(), "daily at 07:00", 60, None, seven)
+            .expect("add");
         db.set_enabled("early", false).expect("disable");
         assert_eq!(
-            enable_job(&db, "early", added).expect("enable"),
-            at(7, 0, 0)
+            enable_job(&db, "early", local_at(14, 6, 0)).expect("enable"),
+            seven
         );
     }
 
@@ -919,7 +956,7 @@ mod tests {
     #[test]
     fn a_run_recorded_after_all_is_left_alone() {
         let db = test_db();
-        let now = Local::now().naive_local();
+        let now = clock::now();
         db.add_job("quick", &quick_command(), "every 1 hours", 60, None, now)
             .expect("add quick");
         let job = db.get_job_by_name("quick").expect("job");

@@ -1,5 +1,6 @@
+use crate::clock;
 use crate::error::{CronlogError, Result};
-use chrono::NaiveDateTime;
+use chrono::{Local, NaiveDateTime, TimeZone};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::path::Path;
@@ -12,6 +13,7 @@ pub struct Job {
     pub schedule: String,
     pub timeout_seconds: i64,
     pub max_runs: Option<i64>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub next_run_at: Option<NaiveDateTime>,
 }
 
@@ -21,6 +23,7 @@ pub struct JobListRow {
     pub command: String,
     pub schedule: String,
     pub enabled: bool,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub next_run_at: Option<NaiveDateTime>,
     pub max_runs: Option<i64>,
     pub scheduled_runs: i64,
@@ -32,8 +35,11 @@ pub struct HistoryRow {
     pub run_id: i64,
     pub status: String,
     pub trigger_type: String,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub scheduled_for: Option<NaiveDateTime>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub started_at: Option<NaiveDateTime>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub finished_at: Option<NaiveDateTime>,
     pub duration_ms: Option<i64>,
     pub exit_code: Option<i64>,
@@ -66,6 +72,7 @@ pub struct StatusRow {
     pub name: String,
     pub enabled: bool,
     pub schedule: String,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub next_run_at: Option<NaiveDateTime>,
     pub max_runs: Option<i64>,
     pub scheduled_runs: i64,
@@ -74,8 +81,11 @@ pub struct StatusRow {
     pub last_run_id: Option<i64>,
     pub last_status: Option<String>,
     pub last_trigger_type: Option<String>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub last_scheduled_for: Option<NaiveDateTime>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub last_started_at: Option<NaiveDateTime>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub last_finished_at: Option<NaiveDateTime>,
     pub last_duration_ms: Option<i64>,
     pub last_exit_code: Option<i64>,
@@ -176,7 +186,7 @@ impl Database {
     }
 
     pub fn init(&self) -> Result<()> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
         let tables: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
             [],
@@ -238,7 +248,74 @@ impl Database {
         if !jobs_has_column(&conn, "max_runs")? {
             conn.execute("ALTER TABLE jobs ADD COLUMN max_runs INTEGER", [])?;
         }
+        self.convert_times_to_utc(&mut conn, &Local)?;
         Ok(())
+    }
+
+    /// Cronlog used to store local wall-clock times, read as `tz`; rewrite them as UTC,
+    /// once. A database with anything in it is first copied next to itself, because the
+    /// change is one-way: an older Cronlog would read the UTC times as local ones.
+    fn convert_times_to_utc<Tz: TimeZone>(&self, conn: &mut Connection, tz: &Tz) -> Result<()> {
+        if user_version(conn)? >= UTC_TIMES {
+            return Ok(());
+        }
+        let has_data: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM jobs) OR EXISTS (SELECT 1 FROM runs)",
+            [],
+            |r| r.get(0),
+        )?;
+        let backup = if has_data {
+            Some(self.backup_before_utc(conn)?)
+        } else {
+            None
+        };
+
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if user_version(&tx)? >= UTC_TIMES {
+            return Ok(()); // another cronlog process converted it first
+        }
+        let mut converted = 0;
+        for (table, column) in LOCAL_TIME_COLUMNS {
+            let rows: Vec<(i64, String)> = tx
+                .prepare(&format!(
+                    "SELECT id, {column} FROM {table} WHERE {column} IS NOT NULL"
+                ))?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut update =
+                tx.prepare(&format!("UPDATE {table} SET {column} = ?1 WHERE id = ?2"))?;
+            for (id, value) in rows {
+                // Anything unreadable is left as it is; nothing reads it now either.
+                if let Some(local) = parse_dt_opt(Some(value)) {
+                    update.execute(params![clock::local_to_utc(tz, local).to_string(), id])?;
+                    converted += 1;
+                }
+            }
+        }
+        tx.pragma_update(None, "user_version", UTC_TIMES)?;
+        tx.commit()?;
+        if let Some(backup) = backup {
+            eprintln!(
+                "Converted {converted} stored times in {} from local time to UTC. The database as it was is at {backup}",
+                self.path
+            );
+        }
+        Ok(())
+    }
+
+    /// A consistent copy of the database at `<path>.before-utc.bak`, or with a timestamp
+    /// if that exists. Returns its path.
+    fn backup_before_utc(&self, conn: &Connection) -> Result<String> {
+        let mut backup = format!("{}.before-utc.bak", self.path);
+        if Path::new(&backup).exists() {
+            backup = format!(
+                "{}.before-utc-{}.bak",
+                self.path,
+                clock::now().format("%Y%m%d%H%M%S")
+            );
+        }
+        conn.execute("VACUUM INTO ?1", params![backup])?;
+        Ok(backup)
     }
 
     pub fn add_job(
@@ -934,6 +1011,22 @@ fn prune_targets(conn: &Connection, keep_last: i64) -> Result<Vec<PruneTarget>> 
     Ok(targets)
 }
 
+/// `PRAGMA user_version` from which job and run times are stored in UTC.
+const UTC_TIMES: i64 = 1;
+
+/// The times Cronlog itself writes, which were local before UTC_TIMES. `created_at`,
+/// `updated_at` and `deleted_at` come from SQLite's CURRENT_TIMESTAMP, always UTC.
+const LOCAL_TIME_COLUMNS: [(&str, &str); 4] = [
+    ("jobs", "next_run_at"),
+    ("runs", "scheduled_for"),
+    ("runs", "started_at"),
+    ("runs", "finished_at"),
+];
+
+fn user_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+}
+
 /// 0 = none, 1 = full, 2 = incremental.
 fn auto_vacuum_mode(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?)
@@ -1334,5 +1427,105 @@ mod tests {
         assert_eq!(status[0].next_run_at, None);
 
         let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn an_old_databases_local_times_are_converted_to_utc_once_with_a_backup() {
+        use chrono_tz::America::New_York;
+        let db = test_db();
+        let local = |s: &str| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").unwrap();
+        // What an older Cronlog in New York left: local times, user_version 0.
+        db.add_job(
+            "a",
+            &["true".into()],
+            "daily at 07:00",
+            60,
+            None,
+            local("2026-11-17 07:00:00"),
+        )
+        .expect("add");
+        let job = db.get_job_by_name("a").expect("job");
+        let ran = db
+            .create_run(
+                job.id,
+                "running",
+                local("2026-06-14 07:00:00.5"),
+                Some(local("2026-06-14 07:00:01")),
+                "schedule",
+            )
+            .expect("run");
+        db.finish_run(
+            ran,
+            "success",
+            local("2026-06-14 07:00:03"),
+            2000,
+            Some(0),
+            None,
+        )
+        .expect("finish");
+        let skipped = db
+            .create_run(
+                job.id,
+                "skipped",
+                local("2026-11-01 01:30:00"),
+                None,
+                "schedule",
+            )
+            .expect("skip");
+        let mut conn = db.conn().expect("conn");
+        conn.pragma_update(None, "user_version", 0)
+            .expect("old version");
+
+        db.convert_times_to_utc(&mut conn, &New_York)
+            .expect("convert");
+        db.convert_times_to_utc(&mut conn, &New_York)
+            .expect("second time is a no-op");
+
+        assert_eq!(user_version(&conn).expect("version"), UTC_TIMES);
+        assert_eq!(
+            db.get_job_by_name("a").expect("job").next_run_at,
+            Some(local("2026-11-17 12:00:00")) // EST, +5h
+        );
+        let history = db.history("a", 10).expect("history");
+        let row = |id| history.iter().find(|r| r.run_id == id).expect("run");
+        assert_eq!(row(ran).scheduled_for, Some(local("2026-06-14 11:00:00.5"))); // EDT, +4h
+        assert_eq!(row(ran).started_at, Some(local("2026-06-14 11:00:01")));
+        assert_eq!(row(ran).finished_at, Some(local("2026-06-14 11:00:03")));
+        // The repeated hour is read as its first occurrence; a skip has no start time.
+        assert_eq!(
+            row(skipped).scheduled_for,
+            Some(local("2026-11-01 05:30:00"))
+        );
+        assert_eq!(row(skipped).started_at, None);
+
+        // The backup holds the times as they were, and was made only once.
+        let backup = format!("{}.before-utc.bak", db.path);
+        let old: String = Connection::open(&backup)
+            .expect("backup")
+            .query_row("SELECT next_run_at FROM jobs", [], |r| r.get(0))
+            .expect("old time");
+        assert_eq!(old, "2026-11-17 07:00:00");
+        let copies = fs::read_dir(std::env::temp_dir())
+            .expect("dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with(&format!(
+                    "{}.before-utc",
+                    Path::new(&db.path).file_name().unwrap().to_string_lossy()
+                ))
+            })
+            .count();
+        assert_eq!(copies, 1);
+    }
+
+    #[test]
+    fn a_new_database_starts_in_utc_without_a_backup() {
+        let db = test_db();
+        assert_eq!(
+            user_version(&db.conn().expect("conn")).expect("version"),
+            UTC_TIMES
+        );
+        assert!(!Path::new(&format!("{}.before-utc.bak", db.path)).exists());
     }
 }
