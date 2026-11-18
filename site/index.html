@@ -189,7 +189,7 @@ backed up 1,204 files (2.3 GB)
           <p class="feature-number">03</p>
           <p class="eyebrow">Overlaps and timeouts</p>
           <h2>No pile-ups. No zombies.</h2>
-          <p>A job never runs twice at once: a slot that comes round while it is still running is recorded as skipped. A timeout kills the job's whole process tree, not just the first process.</p>
+          <p>A scheduled run never starts on top of the last one: a slot that comes round while the job is still running is recorded as skipped. A timeout kills the job's whole process tree, not just the first process.</p>
         </div>
         <div class="code-stage reveal"><div class="code-note">OVERLAP · SKIPPED AND RECORDED</div><code><span>$</span> cronlog add --name sync --schedule "every 15 minutes" --timeout 10m -- ./sync.sh</code><div class="code-lines" aria-hidden="true"><i></i><i></i><i></i><i></i></div></div>
       </div>
