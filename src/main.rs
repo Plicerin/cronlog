@@ -1,4 +1,5 @@
 mod cli;
+mod clock;
 mod db;
 mod error;
 mod runner;
@@ -31,7 +32,7 @@ fn main() -> Result<()> {
                 ));
             }
             let parsed = schedule::parse_schedule(&schedule)?;
-            let next_run_at = parsed.next_after(chrono::Local::now().naive_local())?;
+            let next_run_at = parsed.next_after(clock::now())?;
             let timeout_seconds = timeout.map(|d| d.as_secs() as i64).unwrap_or(3600);
             db.add_job(
                 &name,
@@ -43,9 +44,13 @@ fn main() -> Result<()> {
             )?;
             match max_runs {
                 Some(limit) => println!(
-                    "Added job '{name}' scheduled for {next_run_at} (max {limit} scheduled runs)"
+                    "Added job '{name}' scheduled for {} (max {limit} scheduled runs)",
+                    clock::display(next_run_at)
                 ),
-                None => println!("Added job '{name}' scheduled for {next_run_at}"),
+                None => println!(
+                    "Added job '{name}' scheduled for {}",
+                    clock::display(next_run_at)
+                ),
             }
         }
         Commands::List => {
@@ -98,7 +103,7 @@ fn main() -> Result<()> {
                 max_age: to_chrono(older_than),
                 keep_last,
             };
-            let now = chrono::Local::now().naive_local();
+            let now = clock::now();
             let age = humantime::format_duration(older_than);
             if dry_run {
                 let count = db.count_prunable(retention.cutoff(now), keep_last)?;
@@ -162,11 +167,11 @@ fn main() -> Result<()> {
         }
         Commands::Run { name, now: _ } => {
             let job = db.get_job_by_name(&name)?;
-            scheduler::run_job_once(&db, &job, chrono::Local::now().naive_local(), "manual")?;
+            scheduler::run_job_once(&db, &job, clock::now(), "manual")?;
         }
         Commands::Enable { name } => {
-            let next = scheduler::enable_job(&db, &name, chrono::Local::now().naive_local())?;
-            println!("Enabled job '{name}', next run {next}");
+            let next = scheduler::enable_job(&db, &name, clock::now())?;
+            println!("Enabled job '{name}', next run {}", clock::display(next));
         }
         Commands::Disable { name } => {
             db.set_enabled(&name, false)?;

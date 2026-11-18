@@ -1,5 +1,6 @@
+use crate::clock;
 use crate::error::{CronlogError, Result};
-use chrono::NaiveDateTime;
+use chrono::{Local, NaiveDateTime, TimeZone};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::path::Path;
@@ -12,6 +13,7 @@ pub struct Job {
     pub schedule: String,
     pub timeout_seconds: i64,
     pub max_runs: Option<i64>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub next_run_at: Option<NaiveDateTime>,
 }
 
@@ -21,6 +23,7 @@ pub struct JobListRow {
     pub command: String,
     pub schedule: String,
     pub enabled: bool,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub next_run_at: Option<NaiveDateTime>,
     pub max_runs: Option<i64>,
     pub scheduled_runs: i64,
@@ -32,8 +35,11 @@ pub struct HistoryRow {
     pub run_id: i64,
     pub status: String,
     pub trigger_type: String,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub scheduled_for: Option<NaiveDateTime>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub started_at: Option<NaiveDateTime>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub finished_at: Option<NaiveDateTime>,
     pub duration_ms: Option<i64>,
     pub exit_code: Option<i64>,
@@ -66,6 +72,7 @@ pub struct StatusRow {
     pub name: String,
     pub enabled: bool,
     pub schedule: String,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub next_run_at: Option<NaiveDateTime>,
     pub max_runs: Option<i64>,
     pub scheduled_runs: i64,
@@ -74,8 +81,11 @@ pub struct StatusRow {
     pub last_run_id: Option<i64>,
     pub last_status: Option<String>,
     pub last_trigger_type: Option<String>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub last_scheduled_for: Option<NaiveDateTime>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub last_started_at: Option<NaiveDateTime>,
+    #[serde(serialize_with = "clock::serialize_local")]
     pub last_finished_at: Option<NaiveDateTime>,
     pub last_duration_ms: Option<i64>,
     pub last_exit_code: Option<i64>,
@@ -176,7 +186,7 @@ impl Database {
     }
 
     pub fn init(&self) -> Result<()> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
         let tables: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
             [],
@@ -238,7 +248,104 @@ impl Database {
         if !jobs_has_column(&conn, "max_runs")? {
             conn.execute("ALTER TABLE jobs ADD COLUMN max_runs INTEGER", [])?;
         }
+        self.convert_times_to_utc(&mut conn, &Local)?;
         Ok(())
+    }
+
+    /// Cronlog used to store local wall-clock times, read as `tz`; rewrite them as UTC,
+    /// once. A database with anything in it is first copied next to itself, because the
+    /// change is one-way: an older Cronlog would read the UTC times as local ones.
+    ///
+    /// The copy and the conversion happen while this connection holds the write lock, so
+    /// when several Cronlog processes open an old database at once, one backs it up and
+    /// converts it and the others wait, then find it converted.
+    fn convert_times_to_utc<Tz: TimeZone>(&self, conn: &mut Connection, tz: &Tz) -> Result<()> {
+        if user_version(conn)? >= UTC_TIMES {
+            return Ok(());
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if user_version(&tx)? >= UTC_TIMES {
+            return Ok(()); // another cronlog process converted it first
+        }
+        let has_data: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM jobs) OR EXISTS (SELECT 1 FROM runs)",
+            [],
+            |r| r.get(0),
+        )?;
+        // Readers may share the lock this transaction holds, and it has written nothing
+        // yet, so a second connection copies the database exactly as it is.
+        let backup = if has_data {
+            Some(self.backup_before_utc()?)
+        } else {
+            None
+        };
+
+        let mut converted = 0;
+        for (table, column) in LOCAL_TIME_COLUMNS {
+            let rows: Vec<(i64, String)> = tx
+                .prepare(&format!(
+                    "SELECT id, {column} FROM {table} WHERE {column} IS NOT NULL"
+                ))?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut update =
+                tx.prepare(&format!("UPDATE {table} SET {column} = ?1 WHERE id = ?2"))?;
+            for (id, value) in rows {
+                // Anything unreadable is left as it is; nothing reads it now either.
+                if let Some(local) = parse_dt_opt(Some(value)) {
+                    update.execute(params![clock::local_to_utc(tz, local).to_string(), id])?;
+                    converted += 1;
+                }
+            }
+        }
+        tx.pragma_update(None, "user_version", UTC_TIMES)?;
+        tx.commit()?;
+        if let Some(backup) = backup {
+            eprintln!(
+                "Converted {converted} stored times in {} from local time to UTC. The database as it was is at {backup}",
+                self.path
+            );
+        }
+        Ok(())
+    }
+
+    /// A consistent copy of the database at `<path>.before-utc.bak`, or a name with a
+    /// timestamp if that is taken. Returns its path.
+    ///
+    /// The file is created first, empty and locked down (see `create_backup_file`), so
+    /// job commands and captured output are never readable by more users than the
+    /// database is, not even while the copy is written. Creating it also claims the
+    /// name, so an existing backup is never overwritten.
+    fn backup_before_utc(&self) -> Result<String> {
+        let stamp = clock::now().format("%Y%m%d%H%M%S");
+        let candidates = std::iter::once(format!("{}.before-utc.bak", self.path)).chain(
+            (0..100).map(|n| match n {
+                0 => format!("{}.before-utc-{stamp}.bak", self.path),
+                n => format!("{}.before-utc-{stamp}-{n}.bak", self.path),
+            }),
+        );
+        for backup in candidates {
+            match create_backup_file(&backup, &self.path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+            // A second connection: VACUUM cannot run inside the caller's transaction.
+            let copied = self
+                .conn()
+                .and_then(|c| Ok(c.execute("VACUUM INTO ?1", params![backup])?));
+            return match copied {
+                Ok(_) => Ok(backup),
+                Err(err) => {
+                    let _ = std::fs::remove_file(&backup);
+                    Err(err)
+                }
+            };
+        }
+        Err(CronlogError::InvalidCommand(format!(
+            "could not choose a backup name next to {}",
+            self.path
+        )))
     }
 
     pub fn add_job(
@@ -934,6 +1041,123 @@ fn prune_targets(conn: &Connection, keep_last: i64) -> Result<Vec<PruneTarget>> 
     Ok(targets)
 }
 
+/// Create `path`, empty and new, for a copy of the database at `db`.
+///
+/// - Unix: owner-only (0600). Copying the database's mode is not enough: the new file
+///   takes its folder's group, which may not be the database's.
+/// - Windows: the database's own access list, protected from the folder's inherited
+///   rules, so a database locked down inside a shared folder stays locked down.
+fn create_backup_file(path: &str, db: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(options.open(path)?);
+    #[cfg(windows)]
+    if let Err(err) = copy_access_list(db, path) {
+        let _ = std::fs::remove_file(path);
+        return Err(err);
+    }
+    #[cfg(not(windows))]
+    let _ = db;
+    Ok(())
+}
+
+/// Give `to` the access list (DACL) of `from`, and stop it inheriting its folder's.
+#[cfg(windows)]
+fn copy_access_list(from: &str, to: &str) -> std::io::Result<()> {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+
+    const SE_FILE_OBJECT: i32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetNamedSecurityInfoW(
+            object_name: *const u16,
+            object_type: i32,
+            security_info: u32,
+            owner: *mut *mut c_void,
+            group: *mut *mut c_void,
+            dacl: *mut *mut c_void,
+            sacl: *mut *mut c_void,
+            security_descriptor: *mut *mut c_void,
+        ) -> u32;
+        fn SetNamedSecurityInfoW(
+            object_name: *mut u16,
+            object_type: i32,
+            security_info: u32,
+            owner: *mut c_void,
+            group: *mut c_void,
+            dacl: *mut c_void,
+            sacl: *mut c_void,
+        ) -> u32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    let wide = |s: &str| -> Vec<u16> { OsStr::new(s).encode_wide().chain(Some(0)).collect() };
+    let from = wide(from);
+    let mut to = wide(to);
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the names are NUL-terminated UTF-16; the out-pointers are valid, and
+    // `dacl` points into `descriptor`, which is freed only after it is used.
+    unsafe {
+        let err = GetNamedSecurityInfoW(
+            from.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        );
+        if err != 0 {
+            return Err(std::io::Error::from_raw_os_error(err as i32));
+        }
+        let err = SetNamedSecurityInfoW(
+            to.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null_mut(),
+        );
+        LocalFree(descriptor);
+        if err != 0 {
+            return Err(std::io::Error::from_raw_os_error(err as i32));
+        }
+    }
+    Ok(())
+}
+
+/// `PRAGMA user_version` from which job and run times are stored in UTC.
+const UTC_TIMES: i64 = 1;
+
+/// The times Cronlog itself writes, which were local before UTC_TIMES. `created_at`,
+/// `updated_at` and `deleted_at` come from SQLite's CURRENT_TIMESTAMP, always UTC.
+const LOCAL_TIME_COLUMNS: [(&str, &str); 4] = [
+    ("jobs", "next_run_at"),
+    ("runs", "scheduled_for"),
+    ("runs", "started_at"),
+    ("runs", "finished_at"),
+];
+
+fn user_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+}
+
 /// 0 = none, 1 = full, 2 = incremental.
 fn auto_vacuum_mode(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?)
@@ -1334,5 +1558,243 @@ mod tests {
         assert_eq!(status[0].next_run_at, None);
 
         let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn an_old_databases_local_times_are_converted_to_utc_once_with_a_backup() {
+        use chrono_tz::America::New_York;
+        let db = test_db();
+        let local = |s: &str| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").unwrap();
+        // What an older Cronlog in New York left: local times, user_version 0.
+        db.add_job(
+            "a",
+            &["true".into()],
+            "daily at 07:00",
+            60,
+            None,
+            local("2026-11-17 07:00:00"),
+        )
+        .expect("add");
+        let job = db.get_job_by_name("a").expect("job");
+        let ran = db
+            .create_run(
+                job.id,
+                "running",
+                local("2026-06-14 07:00:00.5"),
+                Some(local("2026-06-14 07:00:01")),
+                "schedule",
+            )
+            .expect("run");
+        db.finish_run(
+            ran,
+            "success",
+            local("2026-06-14 07:00:03"),
+            2000,
+            Some(0),
+            None,
+        )
+        .expect("finish");
+        let skipped = db
+            .create_run(
+                job.id,
+                "skipped",
+                local("2026-11-01 01:30:00"),
+                None,
+                "schedule",
+            )
+            .expect("skip");
+        let mut conn = db.conn().expect("conn");
+        conn.pragma_update(None, "user_version", 0)
+            .expect("old version");
+
+        db.convert_times_to_utc(&mut conn, &New_York)
+            .expect("convert");
+        db.convert_times_to_utc(&mut conn, &New_York)
+            .expect("second time is a no-op");
+
+        assert_eq!(user_version(&conn).expect("version"), UTC_TIMES);
+        assert_eq!(
+            db.get_job_by_name("a").expect("job").next_run_at,
+            Some(local("2026-11-17 12:00:00")) // EST, +5h
+        );
+        let history = db.history("a", 10).expect("history");
+        let row = |id| history.iter().find(|r| r.run_id == id).expect("run");
+        assert_eq!(row(ran).scheduled_for, Some(local("2026-06-14 11:00:00.5"))); // EDT, +4h
+        assert_eq!(row(ran).started_at, Some(local("2026-06-14 11:00:01")));
+        assert_eq!(row(ran).finished_at, Some(local("2026-06-14 11:00:03")));
+        // The repeated hour is read as its first occurrence; a skip has no start time.
+        assert_eq!(
+            row(skipped).scheduled_for,
+            Some(local("2026-11-01 05:30:00"))
+        );
+        assert_eq!(row(skipped).started_at, None);
+
+        // The backup holds the times as they were, and was made only once.
+        let backup = format!("{}.before-utc.bak", db.path);
+        let old: String = Connection::open(&backup)
+            .expect("backup")
+            .query_row("SELECT next_run_at FROM jobs", [], |r| r.get(0))
+            .expect("old time");
+        assert_eq!(old, "2026-11-17 07:00:00");
+        let copies = fs::read_dir(std::env::temp_dir())
+            .expect("dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with(&format!(
+                    "{}.before-utc",
+                    Path::new(&db.path).file_name().unwrap().to_string_lossy()
+                ))
+            })
+            .count();
+        assert_eq!(copies, 1);
+    }
+
+    #[test]
+    fn a_new_database_starts_in_utc_without_a_backup() {
+        let db = test_db();
+        assert_eq!(
+            user_version(&db.conn().expect("conn")).expect("version"),
+            UTC_TIMES
+        );
+        assert!(!Path::new(&format!("{}.before-utc.bak", db.path)).exists());
+    }
+
+    #[test]
+    fn a_backup_never_replaces_an_earlier_one_and_is_as_private_as_the_database() {
+        let db = test_db();
+        db.add_job(
+            "a",
+            &["true".into()],
+            "every 1 hours",
+            60,
+            None,
+            fixed_time(),
+        )
+        .expect("add");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Group-readable: the backup must still be owner-only.
+            fs::set_permissions(&db.path, fs::Permissions::from_mode(0o640)).expect("chmod");
+        }
+        #[cfg(windows)]
+        restrict_to_current_user(&db.path);
+        let first = format!("{}.before-utc.bak", db.path);
+        fs::write(&first, b"an earlier backup").expect("earlier backup");
+
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            names.push(db.backup_before_utc().expect("backup"));
+        }
+        assert_eq!(fs::read(&first).expect("kept"), b"an earlier backup");
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 3, "each backup gets its own name: {names:?}");
+        for name in &names {
+            let jobs: i64 = Connection::open(name)
+                .expect("open backup")
+                .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(jobs, 1, "{name}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(name).expect("meta").permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{name}");
+            }
+            #[cfg(windows)]
+            assert_eq!(access_list(name), access_list(&db.path), "{name}");
+        }
+    }
+
+    /// The file's access rules as icacls lists them, without the path.
+    #[cfg(windows)]
+    fn access_list(path: &str) -> Vec<String> {
+        let out = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .expect("icacls");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| line.replacen(path, "", 1).trim().to_string())
+            .filter(|line| line.contains(':') && !line.starts_with("Successfully"))
+            .collect()
+    }
+
+    /// Drop the file's inherited rules and allow only the current user, so it is
+    /// stricter than a new file in the same folder.
+    #[cfg(windows)]
+    fn restrict_to_current_user(path: &str) {
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        let icacls = |args: &[&str]| {
+            let out = std::process::Command::new("icacls")
+                .arg(path)
+                .args(args)
+                .output()
+                .expect("icacls");
+            assert!(out.status.success(), "icacls {args:?}: {out:?}");
+        };
+        icacls(&["/inheritance:r", "/grant:r", &format!("{user}:F")]);
+        // Some machines (CI runners) also give new files explicit SYSTEM and
+        // Administrators entries; remove them by SID, which no locale renames.
+        icacls(&["/remove:g", "*S-1-5-18", "*S-1-5-32-544"]);
+        let rules = access_list(path);
+        assert_eq!(rules.len(), 1, "{rules:?}");
+
+        let fresh = format!("{path}.fresh");
+        fs::write(&fresh, b"").expect("fresh file");
+        let folder_rules = access_list(&fresh);
+        let _ = fs::remove_file(&fresh);
+        assert_ne!(
+            rules, folder_rules,
+            "the test needs rules the folder would not give"
+        );
+    }
+
+    #[test]
+    fn a_process_opening_an_old_database_while_another_converts_it_waits() {
+        use chrono_tz::America::New_York;
+        let db = test_db();
+        db.add_job(
+            "a",
+            &["true".into()],
+            "every 1 hours",
+            60,
+            None,
+            fixed_time(),
+        )
+        .expect("add");
+        db.conn()
+            .expect("conn")
+            .pragma_update(None, "user_version", 0)
+            .expect("old version");
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    let mut conn = db.conn().expect("conn");
+                    db.convert_times_to_utc(&mut conn, &New_York)
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("thread").expect("convert");
+        }
+        // Converted once (06-11 12:00 EDT is 16:00 UTC), with one backup.
+        assert_eq!(
+            db.get_job_by_name("a").expect("job").next_run_at,
+            Some(fixed_time() + chrono::Duration::hours(4))
+        );
+        let prefix = format!(
+            "{}.before-utc",
+            Path::new(&db.path).file_name().unwrap().to_string_lossy()
+        );
+        let backups = fs::read_dir(std::env::temp_dir())
+            .expect("dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .count();
+        assert_eq!(backups, 1);
     }
 }

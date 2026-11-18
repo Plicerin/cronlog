@@ -49,7 +49,7 @@ cronlog --json logs heartbeat --last
 - `every N second(s)`
 - `every N minute(s)`
 - `every N hour(s)`
-- `daily at HH:MM`
+- `daily at HH:MM`, in the machine's local time zone
 
 Examples:
 
@@ -77,6 +77,19 @@ cronlog add --name pilot --schedule "every 1 hours" --max-runs 12 -- ./pipeline.
 - Bounded runs: optional `--max-runs N`; scheduled runs that actually start count, manual runs and overlap skips do not
 - History retention: once a day the daemon deletes runs (and their logs) scheduled more than 30 days ago. It works one bounded step per tick (500 runs, then about 4 MB of freed space at a time), so jobs never wait long to record results. It always keeps each job's newest 20 runs, every `running` run, and, for a job with `--max-runs`, the runs that count toward its limit. Change it with `daemon --retain 90d --keep-last 50`, or keep everything with `--retain forever`
 - Database size: new databases use SQLite's incremental auto-vacuum, so pruning shrinks the file. A database created by an older Cronlog reuses the freed space but does not shrink until you run `cronlog prune --vacuum` once (it rewrites the file and locks it while it runs; stop the daemon first if the file is large)
+
+## Times and daylight saving
+
+Cronlog stores every time in UTC and uses local time only to show times and to read a `daily at` schedule:
+
+- Interval jobs run at an even real-time pace through clock changes: an `every 5 minutes` job runs every 5 minutes through the night the clocks go back, not pausing for an hour
+- A `daily at` job keeps its wall-clock time, so the day the clocks change it runs 23 or 25 hours after the day before
+- A `daily at` time that happens twice when the clocks go back (01:30 in the US) runs once, the first time
+- A `daily at` time the clocks skip when they go forward (02:30 in the US) runs when the clock jumps, at 03:00
+- Tables show local time with its UTC offset (`2026-11-01 01:30:00 -04:00`), so the two 01:30s of a fall-back night can be told apart. JSON times are RFC 3339 local time with offset (`2026-11-17T12:48:00.5-05:00`)
+- Jobs get `CRONLOG_SCHEDULED_FOR` as local wall-clock time without an offset, as before
+
+A database written by an older Cronlog, which stored local times, is converted to UTC the first time a new Cronlog opens it, after a backup copy is made. See RUNBOOK.md, Backup And Upgrade.
 
 ## Pruning by hand
 

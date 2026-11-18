@@ -1,6 +1,5 @@
 use crate::db::Job;
 use crate::error::{CronlogError, Result};
-use chrono::Local;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -424,10 +423,6 @@ fn max_log_bytes(env_key: &str, default: usize) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
-}
-
-pub fn now() -> chrono::NaiveDateTime {
-    Local::now().naive_local()
 }
 
 #[cfg(test)]

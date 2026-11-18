@@ -1,3 +1,4 @@
+use crate::clock;
 use crate::db::{HistoryRow, JobListRow, LogRow, StatusRow};
 use comfy_table::{presets::UTF8_FULL, Cell, Table};
 use serde::Serialize;
@@ -21,7 +22,7 @@ pub fn print_jobs(jobs: &[JobListRow]) {
             Cell::new(&job.schedule),
             Cell::new(
                 job.next_run_at
-                    .map(|d| d.to_string())
+                    .map(clock::display)
                     .unwrap_or_else(|| "-".into()),
             ),
             Cell::new(format_runs(job.scheduled_runs, job.max_runs)),
@@ -61,17 +62,17 @@ pub fn print_history(rows: &[HistoryRow]) {
             Cell::new(&row.trigger_type),
             Cell::new(
                 row.scheduled_for
-                    .map(|d| d.to_string())
+                    .map(clock::display)
                     .unwrap_or_else(|| "-".into()),
             ),
             Cell::new(
                 row.started_at
-                    .map(|d| d.to_string())
+                    .map(clock::display)
                     .unwrap_or_else(|| "-".into()),
             ),
             Cell::new(
                 row.finished_at
-                    .map(|d| d.to_string())
+                    .map(clock::display)
                     .unwrap_or_else(|| "-".into()),
             ),
             Cell::new(
@@ -115,7 +116,7 @@ pub fn print_status(rows: &[StatusRow]) {
             Cell::new(&row.schedule),
             Cell::new(
                 row.next_run_at
-                    .map(|d| d.to_string())
+                    .map(clock::display)
                     .unwrap_or_else(|| "-".into()),
             ),
             Cell::new(row.running_runs),
@@ -128,7 +129,7 @@ pub fn print_status(rows: &[StatusRow]) {
             Cell::new(row.last_status.clone().unwrap_or_else(|| "-".into())),
             Cell::new(
                 row.last_finished_at
-                    .map(|d| d.to_string())
+                    .map(clock::display)
                     .unwrap_or_else(|| "-".into()),
             ),
             Cell::new(
