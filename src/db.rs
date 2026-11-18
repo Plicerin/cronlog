@@ -1722,19 +1722,34 @@ mod tests {
             .collect()
     }
 
-    /// Drop the file's inherited rules and allow only the current user.
+    /// Drop the file's inherited rules and allow only the current user, so it is
+    /// stricter than a new file in the same folder.
     #[cfg(windows)]
     fn restrict_to_current_user(path: &str) {
         let user = std::env::var("USERNAME").expect("USERNAME");
-        let status = std::process::Command::new("icacls")
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r", &format!("{user}:F")])
-            .output()
-            .expect("icacls")
-            .status;
-        assert!(status.success());
+        let icacls = |args: &[&str]| {
+            let out = std::process::Command::new("icacls")
+                .arg(path)
+                .args(args)
+                .output()
+                .expect("icacls");
+            assert!(out.status.success(), "icacls {args:?}: {out:?}");
+        };
+        icacls(&["/inheritance:r", "/grant:r", &format!("{user}:F")]);
+        // Some machines (CI runners) also give new files explicit SYSTEM and
+        // Administrators entries; remove them by SID, which no locale renames.
+        icacls(&["/remove:g", "*S-1-5-18", "*S-1-5-32-544"]);
         let rules = access_list(path);
         assert_eq!(rules.len(), 1, "{rules:?}");
+
+        let fresh = format!("{path}.fresh");
+        fs::write(&fresh, b"").expect("fresh file");
+        let folder_rules = access_list(&fresh);
+        let _ = fs::remove_file(&fresh);
+        assert_ne!(
+            rules, folder_rules,
+            "the test needs rules the folder would not give"
+        );
     }
 
     #[test]
