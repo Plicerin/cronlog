@@ -177,7 +177,7 @@ pub fn check(db: &Database, now: NaiveDateTime, options: &HealthOptions) -> Resu
 }
 
 /// One line when healthy; otherwise a line per problem.
-pub fn print(report: &HealthReport) {
+pub fn print(report: &HealthReport, color: bool) {
     if report.healthy {
         let daemon = report
             .daemon
@@ -186,11 +186,13 @@ pub fn print(report: &HealthReport) {
             .unwrap_or_default();
         let jobs = report.jobs_checked;
         let plural = if jobs == 1 { "" } else { "s" };
-        println!("healthy: {daemon}; {jobs} job{plural} checked");
+        let healthy = crate::color::paint("healthy", crate::color::GREEN, color);
+        println!("{healthy}: {daemon}; {jobs} job{plural} checked");
         return;
     }
     println!(
-        "UNHEALTHY: {} problem{}",
+        "{}: {} problem{}",
+        crate::color::paint("UNHEALTHY", crate::color::RED, color),
         report.problems.len(),
         if report.problems.len() == 1 { "" } else { "s" }
     );
