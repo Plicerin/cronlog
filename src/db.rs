@@ -963,16 +963,19 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The newest hook that ran to an end (not queued, running or skipped).
-    pub fn last_finished_hook(&self) -> Result<Option<HookRow>> {
+    /// The hook that most recently ran to an end (not queued, running or skipped), for
+    /// one job or any. Ordered by when it finished: the daemon and a manual run can run
+    /// hooks at the same time, so a later id can finish first.
+    pub fn last_finished_hook(&self, job: Option<&str>) -> Result<Option<HookRow>> {
         let conn = self.conn()?;
         Ok(conn
             .query_row(
                 &format!(
                     "{HOOK_ROW_SELECT} WHERE h.status NOT IN ('pending', 'running', 'skipped')
-                     ORDER BY h.id DESC LIMIT 1"
+                       AND (?1 IS NULL OR j.name = ?1)
+                     ORDER BY h.finished_at DESC, h.id DESC LIMIT 1"
                 ),
-                [],
+                params![job],
                 row_to_hook,
             )
             .optional()?)

@@ -163,10 +163,9 @@ pub fn check(db: &Database, now: NaiveDateTime, options: &HealthOptions) -> Resu
     }
 
     // A broken alert shouldn't stay silent: report it if the newest hook to run didn't
-    // succeed. Hooks are set for every job, so a `--job` check sees only its own.
-    if let Some(hook) = db.last_finished_hook()? {
-        let ours = options.job.as_deref().is_none_or(|job| job == hook.job);
-        if hook.status != "success" && ours {
+    // succeed. Hooks are set for every job, so a `--job` check looks at its own.
+    if let Some(hook) = db.last_finished_hook(options.job.as_deref())? {
+        if hook.status != "success" {
             let when = hook
                 .finished_at
                 .map(|t| format!(" at {}", clock::display(t)))

@@ -4,6 +4,7 @@ use crate::db::{
 };
 use crate::error::{CronlogError, Result};
 use crate::{clock, hooks, runner, schedule};
+use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -134,26 +135,41 @@ impl Pruner {
 /// never holds up the schedule.
 struct HookRunner {
     busy: Arc<AtomicBool>,
+    last_sweep: Cell<Instant>,
 }
+
+/// A hook `running` longer than this was cut off: a live one ends within its timeout
+/// plus the drain grace.
+const STALE_HOOK_AFTER: Duration = Duration::from_secs(hooks::HOOK_TIMEOUT.as_secs() * 2);
 
 impl HookRunner {
     fn new(db: &Database) -> Self {
-        // A hook still `running` from before this daemon started was cut off.
+        Self::sweep(db);
+        Self {
+            busy: Arc::new(AtomicBool::new(false)),
+            last_sweep: Cell::new(Instant::now()),
+        }
+    }
+
+    /// Mark hooks left `running` by a process that stopped (this daemon before a
+    /// restart, or a manual run) as interrupted, so health sees them.
+    fn sweep(db: &Database) {
         let now = clock::now();
-        let cutoff = now
-            - chrono::Duration::from_std(hooks::HOOK_TIMEOUT * 2)
-                .unwrap_or(chrono::Duration::zero());
+        let cutoff =
+            now - chrono::Duration::from_std(STALE_HOOK_AFTER).unwrap_or(chrono::Duration::zero());
         match db.interrupt_stale_hooks(cutoff, now) {
             Ok(0) => {}
             Ok(n) => println!("Marked {n} hook run(s) left running as interrupted"),
             Err(err) => eprintln!("Could not check for interrupted hooks: {err}"),
         }
-        Self {
-            busy: Arc::new(AtomicBool::new(false)),
-        }
     }
 
     fn tick(&self, db: &Database) {
+        // Not only at start: a claim cut off just before a restart is too recent then.
+        if self.last_sweep.get().elapsed() >= hooks::HOOK_TIMEOUT {
+            Self::sweep(db);
+            self.last_sweep.set(Instant::now());
+        }
         if self.busy.load(Ordering::SeqCst) {
             return;
         }

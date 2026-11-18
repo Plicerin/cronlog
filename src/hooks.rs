@@ -11,10 +11,9 @@
 use crate::clock;
 use crate::db::{Database, PendingHook, HOOK_FAILURE, HOOK_RECOVERY};
 use crate::error::{CronlogError, Result};
+use crate::runner::{self, Keep};
 use clap::ValueEnum;
-use std::io::Read;
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
@@ -69,7 +68,10 @@ pub struct Outcome {
     pub error: Option<String>,
 }
 
-/// Run a hook: no shell, no stdin, stdout discarded, stderr kept for the error message.
+/// Run a hook: no shell, no stdin, stdout discarded, the end of stderr kept for the
+/// error message. It runs in its own process group, like a job, so a timeout kills
+/// everything it started, and returns within `timeout` plus the runner's drain grace
+/// even when a background process it started holds stderr open.
 pub fn execute(command: &[String], env: &[(&str, String)], timeout: Duration) -> Outcome {
     let started = Instant::now();
     let elapsed = || i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -91,26 +93,35 @@ pub fn execute(command: &[String], env: &[(&str, String)], timeout: Duration) ->
     for (key, value) in env {
         cmd.env(key, value);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => return failed(format!("could not start hook: {e}"), None, elapsed()),
     };
 
-    let stderr = child.stderr.take();
-    let reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut stderr) = stderr {
-            let _ = stderr.read_to_end(&mut buf);
-        }
-        buf
-    });
+    // Drained while the hook runs, keeping only the end, so a chatty hook neither blocks
+    // on a full pipe nor grows the daemon's memory.
+    let reader = child
+        .stderr
+        .take()
+        .map(|stream| runner::spawn_reader_keeping(stream, ERROR_BYTES * 4, "stderr", Keep::Last));
+    // Stops the reader when the hook ends, at the latest after the drain grace.
+    let stderr = |reader| {
+        let captured = runner::collect(
+            reader,
+            Instant::now() + runner::DRAIN_GRACE,
+            &mut Vec::new(),
+        );
+        String::from_utf8_lossy(&captured.bytes).into_owned()
+    };
 
     match child.wait_timeout(timeout) {
         Ok(Some(status)) => {
-            let stderr = reader
-                .join()
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .unwrap_or_default();
+            let stderr = stderr(reader);
             let exit_code = status.code().map(i64::from);
             if status.success() {
                 return Outcome {
@@ -131,9 +142,9 @@ pub fn execute(command: &[String], env: &[(&str, String)], timeout: Duration) ->
             failed(error, exit_code, elapsed())
         }
         Ok(None) => {
-            let _ = child.kill();
+            runner::kill_process_tree(&mut child);
             let _ = child.wait();
-            // The reader is left behind: a grandchild may still hold stderr open.
+            stderr(reader);
             Outcome {
                 status: "timed_out",
                 exit_code: None,
@@ -145,8 +156,9 @@ pub fn execute(command: &[String], env: &[(&str, String)], timeout: Duration) ->
             }
         }
         Err(e) => {
-            let _ = child.kill();
+            runner::kill_process_tree(&mut child);
             let _ = child.wait();
+            stderr(reader);
             failed(format!("could not wait for hook: {e}"), None, elapsed())
         }
     }
@@ -375,6 +387,19 @@ mod tests {
         assert!(out.duration_ms < 4_000, "took {} ms", out.duration_ms);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_background_process_holding_stderr_does_not_hang_the_hook() {
+        let out = execute(
+            &words(&["sh", "-c", "sleep 30 & exit 0"]),
+            &[],
+            HOOK_TIMEOUT,
+        );
+        assert_eq!(out.status, "success", "{out:?}");
+        let bound = crate::runner::DRAIN_GRACE.as_millis() as i64 + 3_000;
+        assert!(out.duration_ms < bound, "took {} ms", out.duration_ms);
+    }
+
     #[test]
     fn stderr_tail_keeps_the_last_lines() {
         let many: String = (1..=50).map(|i| format!("line {i}\n")).collect();
@@ -444,7 +469,7 @@ mod tests {
         let history = db.hook_history(10).expect("hook history");
         assert_eq!(history[0].status, "skipped");
         // A skipped hook is not a failing one.
-        assert!(db.last_finished_hook().expect("last").is_none());
+        assert!(db.last_finished_hook(None).expect("last").is_none());
 
         crate::db::tests_support::remove(db);
     }
@@ -577,6 +602,46 @@ mod tests {
         finished_run(&db, "sync", "success", Some(0), "");
         dispatch_pending(&db).unwrap();
         assert!(!kinds(&db).contains(&"hook_failing"));
+        remove(db);
+    }
+
+    #[test]
+    fn the_latest_hook_is_the_last_to_finish_and_can_be_scoped_to_a_job() {
+        let db = test_db();
+        db.set_hook_command(HOOK_FAILURE, Some("notify")).unwrap();
+        finished_run(&db, "alpha", "failed", Some(1), "");
+        finished_run(&db, "beta", "failed", Some(1), "");
+        let now = clock::now();
+        let first = db.claim_pending_hook(now).unwrap().expect("alpha's hook");
+        let second = db.claim_pending_hook(now).unwrap().expect("beta's hook");
+        // Run side by side: the newer hook fails first, the older one then succeeds.
+        db.finish_hook(
+            second.id,
+            "failed",
+            now + chrono::Duration::seconds(1),
+            5,
+            Some(1),
+            Some("down"),
+        )
+        .unwrap();
+        db.finish_hook(
+            first.id,
+            "success",
+            now + chrono::Duration::seconds(2),
+            5,
+            Some(0),
+            None,
+        )
+        .unwrap();
+
+        let latest = db.last_finished_hook(None).unwrap().expect("latest");
+        assert_eq!(
+            (latest.hook_id, latest.status.as_str()),
+            (first.id, "success")
+        );
+        let beta = db.last_finished_hook(Some("beta")).unwrap().expect("beta");
+        assert_eq!((beta.hook_id, beta.status.as_str()), (second.id, "failed"));
+        assert!(db.last_finished_hook(Some("gamma")).unwrap().is_none());
         remove(db);
     }
 
