@@ -129,7 +129,7 @@ impl Pruner {
 }
 
 /// How often the daemon records that it is alive, for `cronlog health`.
-const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
+pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 
 /// Writes the daemon's heartbeat at most every HEARTBEAT_EVERY. A failed write is
 /// reported and retried next tick; it never stops the daemon.

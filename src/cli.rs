@@ -127,14 +127,14 @@ pub enum Commands {
         #[arg(long, default_value = "5m", value_parser = parse_duration)]
         grace: Duration,
 
-        /// A job whose last N finished runs all failed, timed out or were interrupted is
-        /// failing (skipped runs are not counted)
+        /// A job whose last N runs to finish all failed, timed out or were interrupted is
+        /// failing (skipped runs are not counted; a success resets the count)
         #[arg(long, default_value_t = 3, value_parser = parse_positive_i64)]
         failures: i64,
 
-        /// The daemon is down when not seen for this long (it checks in every 30s), plus
-        /// its poll interval
-        #[arg(long, default_value = "2m", value_parser = parse_duration)]
+        /// The daemon is down when its check-in, due every 30s plus its poll interval, is
+        /// this late
+        #[arg(long, default_value = "90s", value_parser = parse_duration)]
         daemon_stale: Duration,
     },
 

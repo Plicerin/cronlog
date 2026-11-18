@@ -335,7 +335,8 @@ journalctl -u cronlog -n 100 --no-pager
 One check for the daemon and every job, for a watchdog, cron or monitoring system. It exits 1 and lists the problems when something is wrong (see README.md, Health checks):
 
 ```bash
-cronlog --db "$CRONLOG_DB" health || alert "cronlog: $(cronlog --db "$CRONLOG_DB" health)"
+# One check: the alert carries the same result the exit code reported.
+if ! report=$(cronlog --db "$CRONLOG_DB" health 2>&1); then alert "cronlog: $report"; fi
 cronlog --db "$CRONLOG_DB" --json health --job important-job
 ```
 

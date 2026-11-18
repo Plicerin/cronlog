@@ -4,12 +4,9 @@
 use crate::clock;
 use crate::db::{Database, Heartbeat};
 use crate::error::Result;
+use crate::scheduler::HEARTBEAT_EVERY;
 use chrono::{Duration, NaiveDateTime};
 use serde::Serialize;
-
-/// The run statuses that count as a failure in a row. A skip is not one: the job's
-/// previous run was still going.
-const FAILED: [&str; 3] = ["failed", "timed_out", "interrupted"];
 
 /// A run still `running` this long after its timeout is stuck: Cronlog kills a timed-out
 /// job and records it within seconds.
@@ -17,13 +14,16 @@ const STUCK_AFTER_TIMEOUT: Duration = Duration::seconds(60);
 
 #[derive(Debug, Clone)]
 pub struct HealthOptions {
-    /// Check only this job (and the daemon). A disabled job named here is a problem.
+    /// Check only this job (and the daemon). A disabled job named here is a problem, and
+    /// is still checked for failures and stuck runs.
     pub job: Option<String>,
     /// A job whose slot passed this long ago without being claimed is overdue.
     pub grace: Duration,
-    /// This many failed runs in a row is a problem.
+    /// This many failed runs in a row (in completion order; skips not counted) is a
+    /// problem.
     pub failures: i64,
-    /// The daemon is down when it has not been seen for this long, plus its poll interval.
+    /// The daemon is down when its check-in, due every HEARTBEAT_EVERY (plus its poll
+    /// interval), is this late.
     pub daemon_stale: Duration,
 }
 
@@ -74,7 +74,11 @@ pub fn check(db: &Database, now: NaiveDateTime, options: &HealthOptions) -> Resu
         ),
         Some(seen) => {
             let age = now - seen.last_tick;
-            let limit = options.daemon_stale + Duration::seconds(seen.poll_seconds.max(1));
+            // Late, not merely quiet: a check-in is only due HEARTBEAT_EVERY after the
+            // last one, so a threshold shorter than that cannot make a live daemon flap.
+            let due = Duration::from_std(HEARTBEAT_EVERY).unwrap_or(Duration::zero())
+                + Duration::seconds(seen.poll_seconds.max(1));
+            let limit = due + options.daemon_stale;
             if age > limit {
                 problem(
                     "daemon_stale",
@@ -95,11 +99,12 @@ pub fn check(db: &Database, now: NaiveDateTime, options: &HealthOptions) -> Resu
         let job = &checked.job;
         let name = Some(job.name.as_str());
         if !checked.enabled {
+            // Disabling a job stops its schedule, not a run already going, and manual runs
+            // still happen: check those, but there is no slot to be overdue for.
             problem("disabled", name, "job is disabled".into());
-            continue;
         }
 
-        if let Some(due) = job.next_run_at {
+        if let Some(due) = job.next_run_at.filter(|_| checked.enabled) {
             if now - due > options.grace {
                 problem(
                     "overdue",
@@ -113,27 +118,29 @@ pub fn check(db: &Database, now: NaiveDateTime, options: &HealthOptions) -> Resu
             }
         }
 
-        let outcomes = db.recent_outcomes(job.id, options.failures)?;
-        if outcomes.len() as i64 == options.failures
-            && outcomes.iter().all(|o| FAILED.contains(&o.status.as_str()))
-        {
-            let newest = &outcomes[0];
-            let detail = match (&newest.error, newest.exit_code) {
-                (Some(error), _) if !error.is_empty() => format!(": {error}"),
-                (_, Some(code)) => format!(", exit code {code}"),
-                _ => String::new(),
+        if checked.failure_streak >= options.failures {
+            let newest = match db.last_failure(job.id)? {
+                Some(newest) => {
+                    let detail = match (&newest.error, newest.exit_code) {
+                        (Some(error), _) if !error.is_empty() => format!(": {error}"),
+                        (_, Some(code)) => format!(", exit code {code}"),
+                        _ => String::new(),
+                    };
+                    let when = newest
+                        .finished_at
+                        .map(|t| format!(" at {}", clock::display(t)))
+                        .unwrap_or_default();
+                    format!(
+                        "; newest, run #{}, {}{when}{detail}",
+                        newest.run_id, newest.status
+                    )
+                }
+                None => String::new(), // pruned
             };
-            let when = newest
-                .finished_at
-                .map(|t| format!(" at {}", clock::display(t)))
-                .unwrap_or_default();
             problem(
                 "failing",
                 name,
-                format!(
-                    "last {} runs failed; newest, run #{}, {}{when}{detail}",
-                    options.failures, newest.run_id, newest.status
-                ),
+                format!("{} runs in a row failed{newest}", checked.failure_streak),
             );
         }
 
@@ -229,7 +236,7 @@ mod tests {
             job: None,
             grace: Duration::minutes(5),
             failures: 3,
-            daemon_stale: Duration::minutes(2),
+            daemon_stale: Duration::seconds(90),
         }
     }
 
@@ -287,7 +294,7 @@ mod tests {
         assert_eq!(kinds(&report), vec![("daemon_missing", None)]);
 
         beat(&db, at(12, 0));
-        // 2 minutes plus the 1-second poll interval is still fine...
+        // The 30-second check-in, the 1-second poll and 90 seconds late is still fine...
         assert!(check(&db, at(12, 2), &options()).expect("check").healthy);
         // ...a little more is not.
         let report = check(&db, at(12, 3), &options()).expect("check");
@@ -335,6 +342,9 @@ mod tests {
         let newest = finished(&db, "a", "failed", at(12, 15));
         let report = check(&db, at(12, 30), &options()).expect("check");
         assert_eq!(kinds(&report), vec![("failing", Some("a"))]);
+        assert!(report.problems[0]
+            .message
+            .starts_with("3 runs in a row failed"));
         assert!(
             report.problems[0]
                 .message
@@ -346,6 +356,120 @@ mod tests {
 
         finished(&db, "a", "success", at(12, 20));
         assert!(check(&db, at(12, 30), &options()).expect("check").healthy);
+    }
+
+    #[test]
+    fn a_short_stale_limit_does_not_flap_between_check_ins() {
+        let db = test_db();
+        beat(&db, at(12, 0));
+        let short = HealthOptions {
+            daemon_stale: Duration::seconds(5),
+            ..options()
+        };
+        // 30 seconds after a check-in the next is only just due.
+        let between = at(12, 0) + Duration::seconds(30);
+        assert!(check(&db, between, &short).expect("check").healthy);
+        let late = at(12, 0) + Duration::seconds(37);
+        assert_eq!(
+            kinds(&check(&db, late, &short).expect("check")),
+            vec![("daemon_stale", None)]
+        );
+    }
+
+    #[test]
+    fn failures_count_in_the_order_runs_finish() {
+        let db = test_db();
+        db.add_job(
+            "a",
+            &["false".into()],
+            "every 5 minutes",
+            60,
+            None,
+            at(13, 0),
+        )
+        .expect("add");
+        beat(&db, at(12, 30));
+        let job = db.get_job_by_name("a").expect("job");
+        let once = HealthOptions {
+            failures: 1,
+            ..options()
+        };
+        // A manual run succeeds at 12:05; the 12:00 slot, picked up late, fails at 12:10.
+        let manual = db
+            .create_run(job.id, "running", at(12, 5), Some(at(12, 5)), "manual")
+            .expect("manual");
+        let late = db
+            .create_run(job.id, "running", at(12, 0), Some(at(12, 9)), "schedule")
+            .expect("late");
+        db.finish_run(manual, "success", at(12, 5), 1, Some(0), None)
+            .expect("manual done");
+        db.finish_run(late, "failed", at(12, 10), 1, Some(2), None)
+            .expect("late done");
+        let report = check(&db, at(12, 30), &once).expect("check");
+        assert_eq!(kinds(&report), vec![("failing", Some("a"))]);
+        assert!(report.problems[0]
+            .message
+            .contains(&format!("run #{late}, failed")));
+    }
+
+    #[test]
+    fn pruning_old_failures_does_not_end_the_streak() {
+        let db = test_db();
+        db.add_job(
+            "a",
+            &["false".into()],
+            "daily at 07:00",
+            60,
+            None,
+            at(23, 0),
+        )
+        .expect("add");
+        beat(&db, at(12, 30));
+        for hour in 9..12 {
+            finished(&db, "a", "failed", at(hour, 0));
+        }
+        // Keep only the newest run: two of the three failures are gone.
+        let pruned = db.prune_batch(at(12, 30), 1, 100).expect("prune");
+        assert_eq!(pruned.runs, 2);
+        let report = check(&db, at(12, 30), &options()).expect("check");
+        assert_eq!(kinds(&report), vec![("failing", Some("a"))]);
+    }
+
+    #[test]
+    fn interrupted_runs_count_as_failures() {
+        let db = test_db();
+        db.add_job(
+            "a",
+            &["true".into()],
+            "every 5 minutes",
+            60,
+            None,
+            at(13, 0),
+        )
+        .expect("add");
+        beat(&db, at(12, 30));
+        let job = db.get_job_by_name("a").expect("job");
+        for minute in [0, 5] {
+            let id = db
+                .create_run(
+                    job.id,
+                    "running",
+                    at(12, minute),
+                    Some(at(12, minute)),
+                    "schedule",
+                )
+                .expect("run");
+            assert!(db
+                .interrupt_run(id, at(12, minute + 1), "lost")
+                .expect("interrupt"));
+        }
+        db.create_run(job.id, "running", at(12, 10), Some(at(12, 10)), "schedule")
+            .expect("run");
+        db.interrupt_stale_running_runs(at(12, 11), "daemon restarted")
+            .expect("restart");
+        let report = check(&db, at(12, 30), &options()).expect("check");
+        assert_eq!(kinds(&report), vec![("failing", Some("a"))]);
+        assert!(report.problems[0].message.contains("daemon restarted"));
     }
 
     #[test]
@@ -397,6 +521,16 @@ mod tests {
         db.set_enabled("b", false).expect("disable");
         let report = check(&db, at(12, 0), &only("b")).expect("check");
         assert_eq!(kinds(&report), vec![("disabled", Some("b"))]);
+
+        // Disabled, but a run it started before is wedged: both are reported.
+        let job = db.get_job_by_name("b").expect("job");
+        db.create_run(job.id, "running", at(11, 0), Some(at(11, 0)), "schedule")
+            .expect("run");
+        let report = check(&db, at(12, 0), &only("b")).expect("check");
+        assert_eq!(
+            kinds(&report),
+            vec![("disabled", Some("b")), ("stuck", Some("b"))]
+        );
         // Unnamed, a disabled job is simply not checked.
         let report = check(&db, at(12, 0), &options()).expect("check");
         assert_eq!(kinds(&report), vec![("overdue", Some("a"))]);

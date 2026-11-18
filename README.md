@@ -92,18 +92,18 @@ cronlog --json health                # the report as JSON, whatever the result
 It reports:
 
 - `daemon_missing`: no daemon has ever run against this database (or only one older than `health`)
-- `daemon_stale`: the daemon checks in every 30 seconds and has not for `--daemon-stale` (default 2m) plus its poll interval
+- `daemon_stale`: the daemon checks in every 30 seconds (plus its poll interval), and its check-in is more than `--daemon-stale` (default 90s) late
 - `overdue`: a job's run is more than `--grace` (default 5m) late and not started
-- `failing`: a job's last `--failures` (default 3) finished runs all failed, timed out or were interrupted. Skipped runs are not counted
+- `failing`: a job's last `--failures` (default 3) runs to finish all failed, timed out or were interrupted. Skipped runs are not counted, a success resets the count, and pruning old runs does not (the count is kept on the job, and starts when the database is first opened by a Cronlog with `health`)
 - `stuck`: a run is still `running` more than a minute after its timeout
-- `disabled`: the job named with `--job` is disabled. Without `--job`, disabled jobs are not checked
+- `disabled`: the job named with `--job` is disabled. It is still checked for failures and stuck runs, not for being overdue. Without `--job`, disabled jobs are not checked
 
 Example:
 
 ```text
 UNHEALTHY: 2 problems
 - daemon (pid 4242) last seen 11m 3s ago, at 2026-11-17 22:15:18 -05:00 (daemon_stale)
-- sync: last 3 runs failed; newest, run #81, failed at 2026-11-17 22:10:00 -05:00, exit code 1 (failing)
+- sync: 3 runs in a row failed; newest, run #81, failed at 2026-11-17 22:10:00 -05:00, exit code 1 (failing)
 ```
 
 ## Times and daylight saving
