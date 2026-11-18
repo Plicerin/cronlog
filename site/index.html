@@ -298,22 +298,26 @@ CRONLOG_PREVIOUS_STATUS=failed
       <p class="eyebrow">Compared to plain cron</p>
       <h2>Same simple idea.<br>Now with a memory.</h2>
     </div>
-    <div class="comparison-table" role="table" aria-label="Plain cron compared to Cronlog">
-      <div class="comparison-side old" role="rowgroup">
-        <p role="row"><span role="columnheader">Plain cron</span></p>
-        <div role="row"><span role="rowheader">Did it run?</span><b role="cell"><i aria-hidden="true">✕</i> Search the system log</b></div>
-        <div role="row"><span role="rowheader">What did it print?</span><b role="cell"><i aria-hidden="true">✕</i> Mailed, or lost</b></div>
-        <div role="row"><span role="rowheader">Still running from last time</span><b role="cell"><i aria-hidden="true">✕</i> A second copy starts</b></div>
-        <div role="row"><span role="rowheader">A job hangs</span><b role="cell"><i aria-hidden="true">✕</i> It runs until someone notices</b></div>
-        <div role="row"><span role="rowheader">The scheduler stops</span><b role="cell"><i aria-hidden="true">✕</i> Silence</b></div>
+    <div class="comparison-table">
+      <div class="comparison-side old">
+        <p id="cmp-cron">Plain cron</p>
+        <div role="table" aria-labelledby="cmp-cron">
+          <div role="row"><span role="rowheader">Did it run?</span><b role="cell"><i aria-hidden="true">✕</i> Search the system log</b></div>
+          <div role="row"><span role="rowheader">What did it print?</span><b role="cell"><i aria-hidden="true">✕</i> Mailed, or lost</b></div>
+          <div role="row"><span role="rowheader">Still running from last time</span><b role="cell"><i aria-hidden="true">✕</i> A second copy starts</b></div>
+          <div role="row"><span role="rowheader">A job hangs</span><b role="cell"><i aria-hidden="true">✕</i> It runs until someone notices</b></div>
+          <div role="row"><span role="rowheader">The scheduler stops</span><b role="cell"><i aria-hidden="true">✕</i> Silence</b></div>
+        </div>
       </div>
-      <div class="comparison-side new" role="rowgroup">
-        <p role="row"><span role="columnheader">Cronlog</span></p>
-        <div role="row"><span role="rowheader">Did it run?</span><b role="cell"><i aria-hidden="true">✓</i> <code>cronlog history</code></b></div>
-        <div role="row"><span role="rowheader">What did it print?</span><b role="cell"><i aria-hidden="true">✓</i> Kept with the run</b></div>
-        <div role="row"><span role="rowheader">Still running from last time</span><b role="cell"><i aria-hidden="true">✓</i> Skipped, and recorded</b></div>
-        <div role="row"><span role="rowheader">A job hangs</span><b role="cell"><i aria-hidden="true">✓</i> Killed at its timeout</b></div>
-        <div role="row"><span role="rowheader">The scheduler stops</span><b role="cell"><i aria-hidden="true">✓</i> <code>cronlog health</code> exits 1</b></div>
+      <div class="comparison-side new">
+        <p id="cmp-cronlog">Cronlog</p>
+        <div role="table" aria-labelledby="cmp-cronlog">
+          <div role="row"><span role="rowheader">Did it run?</span><b role="cell"><i aria-hidden="true">✓</i> <code>cronlog history</code></b></div>
+          <div role="row"><span role="rowheader">What did it print?</span><b role="cell"><i aria-hidden="true">✓</i> Kept with the run</b></div>
+          <div role="row"><span role="rowheader">Still running from last time</span><b role="cell"><i aria-hidden="true">✓</i> Skipped, and recorded</b></div>
+          <div role="row"><span role="rowheader">A job hangs</span><b role="cell"><i aria-hidden="true">✓</i> Killed at its timeout</b></div>
+          <div role="row"><span role="rowheader">The scheduler stops</span><b role="cell"><i aria-hidden="true">✓</i> <code>cronlog health</code> exits 1</b></div>
+        </div>
       </div>
     </div>
   </section>
