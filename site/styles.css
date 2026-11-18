@@ -67,7 +67,7 @@ pre { margin: 0; }
 .terminal, .product-frame { background: #101010; border: 1px solid #353535; box-shadow: 0 35px 100px #000; color: #e4e4e1; }
 .frame-top {
   height: 39px; padding: 0 14px; display: flex; align-items: center; gap: 6px;
-  border-bottom: 1px solid #292929; color: #777; font: 10px var(--mono);
+  border-bottom: 1px solid #292929; color: #8a8a87; font: 10px var(--mono);
 }
 .frame-top span { width: 7px; height: 7px; background: #484848; border-radius: 50%; }
 .frame-top b { font-weight: 400; margin-left: 8px; }
@@ -77,7 +77,7 @@ pre { margin: 0; }
 }
 .terminal-body.small { font-size: clamp(10.5px, .95vw, 13px); }
 .terminal-body b { color: var(--accent-text); font-weight: 500; }
-.terminal-body i { color: #6f6f6c; font-style: normal; }
+.terminal-body i { color: #8a8a87; font-style: normal; }
 .terminal-body em { font-style: normal; }
 .terminal-body .ok { color: var(--ok); }
 .terminal-body .bad { color: var(--bad); }
@@ -159,7 +159,7 @@ pre { margin: 0; }
 }
 .hero-bottom {
   position: absolute; bottom: 27px; left: 5vw; right: 5vw; display: flex; gap: 12px;
-  color: #757575; font: 11px var(--mono); letter-spacing: .07em;
+  color: #8a8a87; font: 11px var(--mono); letter-spacing: .07em;
 }
 .hero-bottom span:nth-child(2) { margin-left: auto; }
 
@@ -198,7 +198,7 @@ pre { margin: 0; }
 .js .product-frame[data-angle="1"] .view-1,
 .js .product-frame[data-angle="2"] .view-2 { display: block; animation: fade-in .45s ease; }
 @keyframes fade-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-.js .product-steps { display: flex; gap: 26px; margin-top: 20px; font: 11px var(--mono); color: #5f5f5f; }
+.js .product-steps { display: flex; gap: 26px; margin-top: 20px; font: 11px var(--mono); color: #8a8a87; }
 .product-steps .is-active { color: var(--accent-text); }
 
 /* 04 Features */
@@ -310,7 +310,7 @@ pre { margin: 0; }
 .final-scene h2 { font-size: clamp(3.3rem, 7.4vw, 7.6rem); }
 .large-action { margin-top: 38px; padding: 22px 28px; font-size: 15px; }
 footer { padding: 26px 6vw; display: flex; align-items: center; gap: 24px; background: #f1f0ed; border-top: 1px solid #d8d7d4; font-size: 12px; }
-footer p { color: #777; margin: 0; }
+footer p { color: #5f5f5c; margin: 0; }
 footer div { margin-left: auto; display: flex; gap: 20px; color: #555; }
 
 /* Reveal on scroll (only when JS is running) */
