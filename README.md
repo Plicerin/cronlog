@@ -246,3 +246,7 @@ This MVP defaults to direct process execution, not shell execution. Commands are
 ```bash
 cronlog add --name shell-example --schedule "every 1 minute" -- sh -c "echo hello && date"
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
