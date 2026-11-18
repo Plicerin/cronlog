@@ -255,25 +255,31 @@ impl Database {
     /// Cronlog used to store local wall-clock times, read as `tz`; rewrite them as UTC,
     /// once. A database with anything in it is first copied next to itself, because the
     /// change is one-way: an older Cronlog would read the UTC times as local ones.
+    ///
+    /// The copy and the conversion happen while this connection holds the write lock, so
+    /// when several Cronlog processes open an old database at once, one backs it up and
+    /// converts it and the others wait, then find it converted.
     fn convert_times_to_utc<Tz: TimeZone>(&self, conn: &mut Connection, tz: &Tz) -> Result<()> {
         if user_version(conn)? >= UTC_TIMES {
             return Ok(());
         }
-        let has_data: bool = conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM jobs) OR EXISTS (SELECT 1 FROM runs)",
-            [],
-            |r| r.get(0),
-        )?;
-        let backup = if has_data {
-            Some(self.backup_before_utc(conn)?)
-        } else {
-            None
-        };
-
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if user_version(&tx)? >= UTC_TIMES {
             return Ok(()); // another cronlog process converted it first
         }
+        let has_data: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM jobs) OR EXISTS (SELECT 1 FROM runs)",
+            [],
+            |r| r.get(0),
+        )?;
+        // Readers may share the lock this transaction holds, and it has written nothing
+        // yet, so a second connection copies the database exactly as it is.
+        let backup = if has_data {
+            Some(self.backup_before_utc()?)
+        } else {
+            None
+        };
+
         let mut converted = 0;
         for (table, column) in LOCAL_TIME_COLUMNS {
             let rows: Vec<(i64, String)> = tx
@@ -303,19 +309,43 @@ impl Database {
         Ok(())
     }
 
-    /// A consistent copy of the database at `<path>.before-utc.bak`, or with a timestamp
-    /// if that exists. Returns its path.
-    fn backup_before_utc(&self, conn: &Connection) -> Result<String> {
-        let mut backup = format!("{}.before-utc.bak", self.path);
-        if Path::new(&backup).exists() {
-            backup = format!(
-                "{}.before-utc-{}.bak",
-                self.path,
-                clock::now().format("%Y%m%d%H%M%S")
-            );
+    /// A consistent copy of the database at `<path>.before-utc.bak`, or a name with a
+    /// timestamp if that is taken. Returns its path.
+    ///
+    /// The file is created first, empty, with the database's own permissions (never
+    /// wider), so job commands and captured output are never readable by more users
+    /// than the database is, not even while the copy is written. Creating it also claims
+    /// the name, so an existing backup is never overwritten.
+    fn backup_before_utc(&self) -> Result<String> {
+        let stamp = clock::now().format("%Y%m%d%H%M%S");
+        let candidates = std::iter::once(format!("{}.before-utc.bak", self.path)).chain(
+            (0..100).map(|n| match n {
+                0 => format!("{}.before-utc-{stamp}.bak", self.path),
+                n => format!("{}.before-utc-{stamp}-{n}.bak", self.path),
+            }),
+        );
+        for backup in candidates {
+            match create_private_like(&backup, &self.path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+            // A second connection: VACUUM cannot run inside the caller's transaction.
+            let copied = self
+                .conn()
+                .and_then(|c| Ok(c.execute("VACUUM INTO ?1", params![backup])?));
+            return match copied {
+                Ok(_) => Ok(backup),
+                Err(err) => {
+                    let _ = std::fs::remove_file(&backup);
+                    Err(err)
+                }
+            };
         }
-        conn.execute("VACUUM INTO ?1", params![backup])?;
-        Ok(backup)
+        Err(CronlogError::InvalidCommand(format!(
+            "could not choose a backup name next to {}",
+            self.path
+        )))
     }
 
     pub fn add_job(
@@ -1011,6 +1041,21 @@ fn prune_targets(conn: &Connection, keep_last: i64) -> Result<Vec<PruneTarget>> 
     Ok(targets)
 }
 
+/// Create `path`, empty and new, readable and writable by no more users than `like`.
+fn create_private_like(path: &str, like: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mode = std::fs::metadata(like)?.permissions().mode() & 0o666;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = like; // Windows files inherit their folder's access rules.
+    options.open(path).map(|_| ())
+}
+
 /// `PRAGMA user_version` from which job and run times are stored in UTC.
 const UTC_TIMES: i64 = 1;
 
@@ -1527,5 +1572,94 @@ mod tests {
             UTC_TIMES
         );
         assert!(!Path::new(&format!("{}.before-utc.bak", db.path)).exists());
+    }
+
+    #[test]
+    fn a_backup_never_replaces_an_earlier_one_and_is_as_private_as_the_database() {
+        let db = test_db();
+        db.add_job(
+            "a",
+            &["true".into()],
+            "every 1 hours",
+            60,
+            None,
+            fixed_time(),
+        )
+        .expect("add");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&db.path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+        let first = format!("{}.before-utc.bak", db.path);
+        fs::write(&first, b"an earlier backup").expect("earlier backup");
+
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            names.push(db.backup_before_utc().expect("backup"));
+        }
+        assert_eq!(fs::read(&first).expect("kept"), b"an earlier backup");
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 3, "each backup gets its own name: {names:?}");
+        for name in &names {
+            let jobs: i64 = Connection::open(name)
+                .expect("open backup")
+                .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+                .expect("count");
+            assert_eq!(jobs, 1, "{name}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(name).expect("meta").permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_process_opening_an_old_database_while_another_converts_it_waits() {
+        use chrono_tz::America::New_York;
+        let db = test_db();
+        db.add_job(
+            "a",
+            &["true".into()],
+            "every 1 hours",
+            60,
+            None,
+            fixed_time(),
+        )
+        .expect("add");
+        db.conn()
+            .expect("conn")
+            .pragma_update(None, "user_version", 0)
+            .expect("old version");
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    let mut conn = db.conn().expect("conn");
+                    db.convert_times_to_utc(&mut conn, &New_York)
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("thread").expect("convert");
+        }
+        // Converted once (06-11 12:00 EDT is 16:00 UTC), with one backup.
+        assert_eq!(
+            db.get_job_by_name("a").expect("job").next_run_at,
+            Some(fixed_time() + chrono::Duration::hours(4))
+        );
+        let prefix = format!(
+            "{}.before-utc",
+            Path::new(&db.path).file_name().unwrap().to_string_lossy()
+        );
+        let backups = fs::read_dir(std::env::temp_dir())
+            .expect("dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .count();
+        assert_eq!(backups, 1);
     }
 }

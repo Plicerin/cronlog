@@ -374,7 +374,7 @@ cronlog --db /var/lib/cronlog/cronlog.db status
 
 Stop the daemon before installing the new binary, as above: never let two versions share a database.
 
-Upgrading from a version that stored local times (before UTC storage): the first command the new binary runs converts the database's job and run times from local time to UTC, once, and prints how many it converted. It first copies the database to `cronlog.db.before-utc.bak` beside it (or `cronlog.db.before-utc-<UTC timestamp>.bak` if that exists). The conversion is one-way: an older binary would read the UTC times as local ones and, in New York, wait 4 to 5 hours for every job. To go back to an older binary, restore that backup (see Rollback); runs recorded since the upgrade are lost.
+Upgrading from a version that stored local times (before UTC storage): the first command the new binary runs converts the database's job and run times from local time to UTC, once, and prints how many it converted. It first copies the database beside itself, to `cronlog.db.before-utc.bak`, or to a name with a UTC timestamp if that file already exists (an earlier backup is never replaced), and prints the path it used: note it. The copy gets the database's own file permissions. The conversion is one-way: an older binary would read the UTC times as local ones and, in New York, wait 4 to 5 hours for every job. To go back to an older binary, restore that backup (see Rollback); runs recorded since the upgrade are lost.
 
 ## 12. Rollback
 
@@ -406,12 +406,13 @@ sudo install -m 0755 /path/to/previous/cronlog /usr/local/bin/cronlog
 sudo systemctl restart cronlog
 ```
 
-Rolling back past the UTC-storage release also needs the database from before it:
+Rolling back past the UTC-storage release also needs the database from before it. Restore the exact backup the conversion printed; if there are several `cronlog.db.before-utc*.bak` files, the others are from earlier attempts and may be stale:
 
 ```bash
 sudo systemctl stop cronlog
 cp /var/lib/cronlog/cronlog.db /var/lib/cronlog/cronlog.db.utc.bak
-cp /var/lib/cronlog/cronlog.db.before-utc.bak /var/lib/cronlog/cronlog.db
+# The path the conversion printed: "The database as it was is at ..."
+cp -p /var/lib/cronlog/cronlog.db.before-utc.bak /var/lib/cronlog/cronlog.db
 sudo install -m 0755 /path/to/previous/cronlog /usr/local/bin/cronlog
 sudo systemctl start cronlog
 ```
