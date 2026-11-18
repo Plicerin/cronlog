@@ -55,7 +55,7 @@ pre { margin: 0; }
 
 /* Shared headline + eyebrow */
 .eyebrow { margin: 0 0 18px; font-size: 11px; letter-spacing: .14em; text-transform: uppercase; font-weight: 600; color: #676767; }
-.on-dark { color: #a0a09d; }
+.on-dark, .feature-dark .eyebrow, .comparison-scene .eyebrow { color: #a0a09d; }
 .hero-copy h1, .transformation h2, .product-intro h2, .feature-copy h2, .devices-copy h2,
 .metrics-scene h2, .comparison-head h2, .pricing-head h2, .final-scene h2 {
   margin: 0; letter-spacing: -.072em; line-height: .86; font-weight: 600;
