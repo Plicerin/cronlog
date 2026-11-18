@@ -1,3 +1,4 @@
+use crate::color::ColorChoice;
 use clap::{Parser, Subcommand};
 use std::time::Duration;
 
@@ -77,6 +78,10 @@ pub struct Cli {
     /// Emit machine-readable JSON for inspection commands
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Colour run statuses in tables and health output
+    #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
+    pub color: ColorChoice,
 
     #[command(subcommand)]
     pub command: Commands,

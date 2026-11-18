@@ -45,6 +45,8 @@ cronlog --json history heartbeat --limit 5
 cronlog --json logs heartbeat --last
 ```
 
+In a terminal, tables and `health` are coloured: `success` green; `failed`, `timed_out` and `interrupted` red; `skipped` yellow; `running` cyan; disabled jobs yellow; non-zero exit codes and errors red. Colour turns off when output is piped or redirected, when `NO_COLOR` is set, or when `TERM=dumb`. `--color always` forces it on and `--color never` turns it off. JSON is never coloured.
+
 ## Supported schedules
 
 - `every N second(s)`

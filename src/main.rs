@@ -1,5 +1,6 @@
 mod cli;
 mod clock;
+mod color;
 mod db;
 mod error;
 mod health;
@@ -18,6 +19,7 @@ fn main() -> Result<()> {
     let db = Database::open(&cli.db)?;
     db.init()?;
     let json = cli.json;
+    let color = color::for_stdout(cli.color);
 
     match cli.command {
         Commands::Add {
@@ -59,7 +61,7 @@ fn main() -> Result<()> {
             if json {
                 ui::print_json(&jobs)?;
             } else {
-                ui::print_jobs(&jobs);
+                ui::print_jobs(&jobs, color);
             }
         }
         Commands::Status { name } => {
@@ -67,7 +69,7 @@ fn main() -> Result<()> {
             if json {
                 ui::print_json(&rows)?;
             } else {
-                ui::print_status(&rows);
+                ui::print_status(&rows, color);
             }
         }
         Commands::Health {
@@ -86,7 +88,7 @@ fn main() -> Result<()> {
             if json {
                 ui::print_json(&report)?;
             } else {
-                health::print(&report);
+                health::print(&report, color);
             }
             if !report.healthy {
                 std::process::exit(1);
@@ -168,7 +170,7 @@ fn main() -> Result<()> {
             if json {
                 ui::print_json(&rows)?;
             } else {
-                ui::print_history(&rows);
+                ui::print_history(&rows, color);
             }
         }
         Commands::Logs { name, last, run_id } => {
