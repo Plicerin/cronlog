@@ -213,9 +213,11 @@ fn env_for(hook: &PendingHook) -> Vec<(&'static str, String)> {
 
 /// Run every queued hook, oldest first, and record how each went. Returns how many
 /// were taken from the queue.
-pub fn dispatch_pending(db: &Database) -> Result<usize> {
+/// Run queued hooks, oldest first: all of them, or only those of `run_id` (a manual run
+/// sends its own alert and leaves any backlog to the daemon).
+pub fn dispatch_pending(db: &Database, run_id: Option<i64>) -> Result<usize> {
     let mut taken = 0;
-    while let Some(hook) = db.claim_pending_hook(clock::now())? {
+    while let Some(hook) = db.claim_pending_hook(clock::now(), run_id)? {
         taken += 1;
         let outcome = match db.hook_command(&hook.event)? {
             // Cleared after this hook was queued.
@@ -436,8 +438,8 @@ mod tests {
         let run_id =
             crate::db::tests_support::failed_run(&db, "report", "source 2/3 returned HTTP 503");
 
-        assert_eq!(dispatch_pending(&db).expect("dispatch"), 1);
-        assert_eq!(dispatch_pending(&db).expect("dispatch again"), 0);
+        assert_eq!(dispatch_pending(&db, None).expect("dispatch"), 1);
+        assert_eq!(dispatch_pending(&db, None).expect("dispatch again"), 0);
 
         let env = std::fs::read_to_string(&env_file).expect("hook wrote its environment");
         assert!(env.contains("CRONLOG_EVENT=failure"), "{env}");
@@ -465,7 +467,7 @@ mod tests {
         crate::db::tests_support::failed_run(&db, "report", "");
         db.set_hook_command(HOOK_FAILURE, None).expect("clear hook");
 
-        dispatch_pending(&db).expect("dispatch");
+        dispatch_pending(&db, None).expect("dispatch");
         let history = db.hook_history(10).expect("hook history");
         assert_eq!(history[0].status, "skipped");
         // A skipped hook is not a failing one.
@@ -548,9 +550,9 @@ mod tests {
         let db = test_db();
         db.set_hook_command(HOOK_FAILURE, Some("notify")).unwrap();
         finished_run(&db, "sync", "failed", Some(1), "boom");
-        let first = db.claim_pending_hook(clock::now()).unwrap();
+        let first = db.claim_pending_hook(clock::now(), None).unwrap();
         assert!(first.is_some());
-        assert!(db.claim_pending_hook(clock::now()).unwrap().is_none());
+        assert!(db.claim_pending_hook(clock::now(), None).unwrap().is_none());
         assert_eq!(first.unwrap().stderr.as_deref(), Some("boom"));
         remove(db);
     }
@@ -561,7 +563,7 @@ mod tests {
         db.set_hook_command(HOOK_FAILURE, Some("notify")).unwrap();
         finished_run(&db, "sync", "failed", Some(1), "");
         let then = clock::now() - chrono::Duration::minutes(5);
-        db.claim_pending_hook(then).unwrap().expect("claimed");
+        db.claim_pending_hook(then, None).unwrap().expect("claimed");
         assert_eq!(
             db.interrupt_stale_hooks(clock::now() - chrono::Duration::minutes(1), clock::now())
                 .unwrap(),
@@ -593,14 +595,14 @@ mod tests {
         db.set_hook_command(HOOK_FAILURE, Some(&failing_hook))
             .unwrap();
         finished_run(&db, "sync", "failed", Some(1), "");
-        dispatch_pending(&db).unwrap();
+        dispatch_pending(&db, None).unwrap();
         assert!(kinds(&db).contains(&"hook_failing"));
 
         let working_hook = shell_words::join(exit_with(0).iter().map(String::as_str));
         db.set_hook_command(HOOK_RECOVERY, Some(&working_hook))
             .unwrap();
         finished_run(&db, "sync", "success", Some(0), "");
-        dispatch_pending(&db).unwrap();
+        dispatch_pending(&db, None).unwrap();
         assert!(!kinds(&db).contains(&"hook_failing"));
         remove(db);
     }
@@ -612,8 +614,14 @@ mod tests {
         finished_run(&db, "alpha", "failed", Some(1), "");
         finished_run(&db, "beta", "failed", Some(1), "");
         let now = clock::now();
-        let first = db.claim_pending_hook(now).unwrap().expect("alpha's hook");
-        let second = db.claim_pending_hook(now).unwrap().expect("beta's hook");
+        let first = db
+            .claim_pending_hook(now, None)
+            .unwrap()
+            .expect("alpha's hook");
+        let second = db
+            .claim_pending_hook(now, None)
+            .unwrap()
+            .expect("beta's hook");
         // Run side by side: the newer hook fails first, the older one then succeeds.
         db.finish_hook(
             second.id,
@@ -646,14 +654,88 @@ mod tests {
     }
 
     #[test]
-    fn pruning_a_run_removes_its_hook_rows() {
+    fn pruning_keeps_a_run_until_its_hook_has_run_then_removes_both() {
         let db = test_db();
         db.set_hook_command(HOOK_FAILURE, Some("notify")).unwrap();
         finished_run(&db, "sync", "failed", Some(1), "");
         finished_run(&db, "sync", "success", Some(0), "");
-        db.prune_batch(clock::now() + chrono::Duration::days(1), 1, 100)
+        let later = clock::now() + chrono::Duration::days(1);
+        assert_eq!(db.count_prunable(later, 1).unwrap(), 0);
+        db.prune_batch(later, 1, 100).unwrap();
+        assert_eq!(db.hook_history(10).unwrap().len(), 1, "queued alert kept");
+
+        let hook = db
+            .claim_pending_hook(clock::now(), None)
+            .unwrap()
+            .expect("hook");
+        db.finish_hook(hook.id, "success", clock::now(), 5, Some(0), None)
             .unwrap();
+        assert_eq!(db.count_prunable(later, 1).unwrap(), 1);
+        db.prune_batch(later, 1, 100).unwrap();
         assert!(db.hook_history(10).unwrap().is_empty());
+        remove(db);
+    }
+
+    #[test]
+    fn a_manual_run_dispatches_only_its_own_hook() {
+        let db = test_db();
+        let hook = shell_words::join(exit_with(0).iter().map(String::as_str));
+        db.set_hook_command(HOOK_FAILURE, Some(&hook)).unwrap();
+        finished_run(&db, "backlog", "failed", Some(1), "");
+        let ours = finished_run(&db, "manual", "failed", Some(1), "");
+        assert_eq!(dispatch_pending(&db, Some(ours)).unwrap(), 1);
+        let history = db.hook_history(10).unwrap();
+        let status = |job: &str| {
+            history
+                .iter()
+                .find(|h| h.job == job)
+                .map(|h| h.status.clone())
+                .unwrap()
+        };
+        assert_eq!(status("manual"), "success");
+        assert_eq!(status("backlog"), "pending", "left to the daemon");
+        remove(db);
+    }
+
+    #[test]
+    fn a_truncated_log_still_gives_the_hook_the_real_end_of_stderr() {
+        let db = test_db();
+        db.set_hook_command(HOOK_FAILURE, Some("notify")).unwrap();
+        let now = clock::now();
+        db.add_job("big", &["echo".into()], "every 1 hours", 3600, None, now)
+            .unwrap();
+        let job = db.get_job_by_name("big").unwrap();
+        let run = db
+            .create_run(job.id, "running", now, Some(now), "schedule")
+            .unwrap();
+        db.record_result(
+            run,
+            &crate::db::RunResult {
+                status: "failed",
+                finished_at: now,
+                duration_ms: 10,
+                exit_code: Some(1),
+                error: None,
+                stdout: "",
+                stderr: "progress 1
+...[truncated by cronlog at 256 bytes]",
+                stdout_truncated: false,
+                stderr_truncated: true,
+                stderr_tail: Some(
+                    "progress 9000
+Fatal: disk full",
+                ),
+            },
+        )
+        .unwrap();
+        let hook = db.claim_pending_hook(now, None).unwrap().expect("hook");
+        assert_eq!(
+            hook.stderr.as_deref(),
+            Some(
+                "progress 9000
+Fatal: disk full"
+            )
+        );
         remove(db);
     }
 }

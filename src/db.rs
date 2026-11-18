@@ -175,6 +175,8 @@ pub struct RunResult<'a> {
     pub stderr: &'a str,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// The end of stderr when `stderr` is a truncated start, for a failure hook.
+    pub stderr_tail: Option<&'a str>,
 }
 
 /// The daemon's last sign of life, written every HEARTBEAT_EVERY.
@@ -223,7 +225,9 @@ pub struct PruneReport {
 /// any `running` runs are scanned and kept.
 const PRUNABLE_FOR_JOB: &str = "FROM runs INDEXED BY idx_runs_job_scheduled
     WHERE job_id = ?1 AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
-      AND status <> 'running'";
+      AND status <> 'running'
+      AND NOT EXISTS (SELECT 1 FROM hook_runs h WHERE h.run_id = runs.id
+                      AND h.status IN ('pending', 'running'))";
 
 /// For a live job with `--max-runs`: its limit is enforced by counting its scheduled,
 /// started runs, so only its overlap skips and its manual runs may go. Separate indexed
@@ -231,11 +235,15 @@ const PRUNABLE_FOR_JOB: &str = "FROM runs INDEXED BY idx_runs_job_scheduled
 /// index: left to itself SQLite picks idx_runs_job_scheduled and walks those runs.
 const PRUNABLE_SKIPS_FOR_BOUNDED_JOB: &str = "FROM runs INDEXED BY idx_runs_job_trigger_status
     WHERE job_id = ?1 AND trigger_type = 'schedule' AND status = 'skipped'
-      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)";
+      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
+      AND NOT EXISTS (SELECT 1 FROM hook_runs h WHERE h.run_id = runs.id
+                      AND h.status IN ('pending', 'running'))";
 const PRUNABLE_MANUAL_FOR_BOUNDED_JOB: &str = "FROM runs INDEXED BY idx_runs_job_trigger_status
     WHERE job_id = ?1 AND trigger_type = 'manual'
       AND status IN ('success', 'failed', 'timed_out', 'interrupted', 'skipped')
-      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)";
+      AND scheduled_for < ?2 AND (scheduled_for, id) < (?3, ?4)
+      AND NOT EXISTS (SELECT 1 FROM hook_runs h WHERE h.run_id = runs.id
+                      AND h.status IN ('pending', 'running'))";
 
 /// The prunable-run filters for one job.
 fn prunable_filters(protect_counted: bool) -> &'static [&'static str] {
@@ -366,7 +374,8 @@ impl Database {
                 finished_at TEXT,
                 duration_ms INTEGER,
                 exit_code INTEGER,
-                error TEXT
+                error TEXT,
+                stderr_tail TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(enabled, next_run_at, deleted_at);
@@ -880,21 +889,27 @@ impl Database {
 
     /// Take the oldest queued hook and mark it `running`, in one transaction, so two
     /// processes (the daemon and a manual run) never run the same hook.
-    pub fn claim_pending_hook(&self, now: NaiveDateTime) -> Result<Option<PendingHook>> {
+    /// Take the oldest queued hook (of one run, if given) and mark it running.
+    pub fn claim_pending_hook(
+        &self,
+        now: NaiveDateTime,
+        run_id: Option<i64>,
+    ) -> Result<Option<PendingHook>> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pending = tx
             .query_row(
                 "SELECT h.id, h.event, h.failure_streak, h.run_id, j.name,
                         r.status, r.exit_code, r.error, r.finished_at,
-                        (SELECT l.stderr FROM logs l WHERE l.run_id = h.run_id ORDER BY l.id DESC LIMIT 1)
+                        COALESCE(h.stderr_tail,
+                            (SELECT l.stderr FROM logs l WHERE l.run_id = h.run_id ORDER BY l.id DESC LIMIT 1))
                  FROM hook_runs h
                  JOIN jobs j ON j.id = h.job_id
                  LEFT JOIN runs r ON r.id = h.run_id
-                 WHERE h.status = 'pending'
+                 WHERE h.status = 'pending' AND (?1 IS NULL OR h.run_id = ?1)
                  ORDER BY h.id
                  LIMIT 1",
-                [],
+                params![run_id],
                 |r| {
                     Ok(PendingHook {
                         id: r.get(0)?,
@@ -1030,6 +1045,12 @@ impl Database {
                 result.stderr_truncated as i64
             ],
         )?;
+        if let Some(tail) = result.stderr_tail {
+            tx.execute(
+                "UPDATE hook_runs SET stderr_tail = ?1 WHERE run_id = ?2 AND status = 'pending'",
+                params![tail, run_id],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1722,6 +1743,7 @@ pub mod tests_support {
                 stderr,
                 stdout_truncated: false,
                 stderr_truncated: false,
+                stderr_tail: None,
             },
         )
         .expect("record result");

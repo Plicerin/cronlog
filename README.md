@@ -128,7 +128,7 @@ When they run:
 - `recovery`: a job's first success after one or more failures
 - Skipped runs never trigger a hook, and manual runs count like scheduled ones
 
-Each hook is queued in the same transaction that records the run, then run by the daemon within a poll interval, or straight after `cronlog run --now`. A hook still queued when Cronlog stops runs the next time it starts, so alerts are not lost to a restart. Runs interrupted by a daemon restart count as failures, so a reboot that kills a job alerts too.
+Each hook is queued in the same transaction that records the run, then run by the daemon within a poll interval, or straight after `cronlog run --now`. A hook still queued when Cronlog stops runs the next time it starts, so alerts are not lost to a restart. One cut off while running (a crash or reboot mid-hook) is not retried, since it may already have sent its alert: it is recorded as `interrupted` and `cronlog health` reports it. Pruning keeps a run until its hook has run. Runs interrupted by a daemon restart count as failures, so a reboot that kills a job alerts too.
 
 The command runs without a shell, like a job, with no stdin, its stdout discarded and its stderr kept if it fails. It is killed after 30 seconds. It gets:
 
@@ -139,7 +139,7 @@ The command runs without a shell, like a job, with no stdin, its stdout discarde
 | `CRONLOG_STATUS`, `CRONLOG_EXIT_CODE`, `CRONLOG_ERROR` | how that run ended (exit code and error only when there is one) |
 | `CRONLOG_FINISHED_AT` | when it ended, in local time |
 | `CRONLOG_FAILURE_STREAK` | `1` for a failure; for a recovery, how many runs in a row had failed |
-| `CRONLOG_STDERR_TAIL` | the last 20 lines (at most 2000 bytes) of the run's error output, when there is any |
+| `CRONLOG_STDERR_TAIL` | the last 20 lines (at most 2000 bytes) of the run's error output, when there is any, even when the logged output was truncated |
 | `CRONLOG_TEST` | `1` under `cronlog hook test` only |
 
 Each hook run is recorded (`cronlog hook history`, or `--json`), and `cronlog health` reports `hook_failing` while the newest one failed, so a broken notifier does not stay silent.

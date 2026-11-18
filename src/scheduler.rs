@@ -185,7 +185,8 @@ impl HookRunner {
         let busy = Arc::clone(&self.busy);
         let db = db.clone();
         thread::spawn(move || {
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| hooks::dispatch_pending(&db)));
+            let outcome =
+                panic::catch_unwind(AssertUnwindSafe(|| hooks::dispatch_pending(&db, None)));
             match outcome {
                 Ok(Ok(_)) => {}
                 Ok(Err(err)) => eprintln!("Could not run hooks: {err}"),
@@ -389,9 +390,10 @@ pub fn run_manual(
     );
 
     let result = execute_claimed_run(db, job, run_id, scheduled_for, trigger_type, previous);
-    // Run the hook this run queued (if any) before exiting; a daemon would also
-    // pick it up, and the claim keeps the two from both running it.
-    if let Err(err) = hooks::dispatch_pending(db) {
+    // Send the hook this run queued (if any) before exiting; a daemon would also
+    // pick it up, and the claim keeps the two from both running it. Other queued
+    // hooks are left to the daemon, so a backlog can't hold up this command.
+    if let Err(err) = hooks::dispatch_pending(db, Some(run_id)) {
         eprintln!("Could not run hooks: {err}");
     }
     result
@@ -450,6 +452,7 @@ fn execute_claimed_run(
                     stderr: &out.stderr,
                     stdout_truncated: out.stdout_truncated,
                     stderr_truncated: out.stderr_truncated,
+                    stderr_tail: out.stderr_tail.as_deref(),
                 },
             )?;
             println!(
@@ -472,6 +475,7 @@ fn execute_claimed_run(
                     stderr: &message,
                     stdout_truncated: false,
                     stderr_truncated: false,
+                    stderr_tail: None,
                 },
             )?;
             println!("Failed job '{}' run #{}: {}", job.name, run_id, message);
@@ -865,6 +869,7 @@ mod tests {
             stderr: "",
             stdout_truncated: false,
             stderr_truncated: false,
+            stderr_tail: None,
         };
         db.record_result(id, &result).expect("record");
         assert_eq!(last_status(&db, "a"), "success");
