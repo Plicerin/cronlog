@@ -1,6 +1,6 @@
 use crate::clock;
 use crate::color;
-use crate::db::{HistoryRow, JobListRow, LogRow, StatusRow};
+use crate::db::{HistoryRow, HookRow, JobListRow, LogRow, StatusRow};
 use comfy_table::{presets::UTF8_FULL, Cell, Color, Table};
 use serde::Serialize;
 
@@ -184,6 +184,41 @@ pub fn print_status(rows: &[StatusRow], color: bool) {
         ]);
     }
 
+    println!("{table}");
+}
+
+pub fn print_hook_history(rows: &[HookRow], color: bool) {
+    let mut table = new_table(color);
+    table.set_header(vec![
+        "Hook", "Event", "Job", "Run", "Status", "Started", "Duration", "Exit", "Error",
+    ]);
+    let time =
+        |t: Option<chrono::NaiveDateTime>| t.map(clock::display).unwrap_or_else(|| "-".into());
+    for row in rows {
+        table.add_row(vec![
+            Cell::new(row.hook_id),
+            Cell::new(&row.event),
+            Cell::new(&row.job),
+            Cell::new(row.run_id),
+            paint(
+                Cell::new(&row.status),
+                color::for_status(&row.status),
+                color,
+            ),
+            Cell::new(time(row.started_at)),
+            Cell::new(
+                row.duration_ms
+                    .map(|d| format!("{d}ms"))
+                    .unwrap_or_else(|| "-".into()),
+            ),
+            exit_cell(row.exit_code, color),
+            paint(
+                Cell::new(row.error.clone().unwrap_or_default()),
+                Some(Color::DarkRed),
+                color,
+            ),
+        ]);
+    }
     println!("{table}");
 }
 

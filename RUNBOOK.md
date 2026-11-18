@@ -342,6 +342,14 @@ cronlog --db "$CRONLOG_DB" --json health --job important-job
 
 A daemon from before `health` writes no heartbeat, so `health` reports `daemon_missing` until the daemon is upgraded and restarted.
 
+To be told when a job starts failing or recovers, without polling, set a failure hook once for every job (see README.md, Failure hooks), and test it:
+
+```bash
+cronlog --db "$CRONLOG_DB" hook set failure -- /usr/bin/python3 /opt/alerts/notify.py
+cronlog --db "$CRONLOG_DB" hook set recovery -- /usr/bin/python3 /opt/alerts/notify.py
+cronlog --db "$CRONLOG_DB" hook test failure
+```
+
 Detailed job state:
 
 ```bash

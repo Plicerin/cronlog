@@ -1,4 +1,5 @@
 use crate::color::ColorChoice;
+use crate::hooks::HookEvent;
 use clap::{Parser, Subcommand};
 use std::time::Duration;
 
@@ -85,6 +86,43 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HookCommand {
+    /// Set the hook for an event. The command goes after --, like `cronlog add`; it
+    /// runs without a shell, with the job's details in CRONLOG_* variables.
+    Set {
+        /// failure: a job's first failure, timeout or interruption after a success;
+        /// recovery: its first success after failures
+        #[arg(value_enum)]
+        event: HookEvent,
+
+        /// Command and arguments to run. Put this after --
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+
+    /// Show the hooks that are set
+    Show,
+
+    /// Remove a hook, or both if no event is named
+    Clear {
+        #[arg(value_enum)]
+        event: Option<HookEvent>,
+    },
+
+    /// Run a hook now with sample values (CRONLOG_TEST=1) to check it works; not recorded
+    Test {
+        #[arg(value_enum, default_value_t = HookEvent::Failure)]
+        event: HookEvent,
+    },
+
+    /// Recent hook runs, newest first
+    History {
+        #[arg(short, long, default_value_t = 20)]
+        limit: i64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -226,4 +264,10 @@ pub enum Commands {
 
     /// Remove a job and its future schedule. Run history is kept.
     Remove { name: String },
+
+    /// Commands run, for every job, when a job starts failing or recovers
+    Hook {
+        #[command(subcommand)]
+        action: HookCommand,
+    },
 }

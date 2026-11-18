@@ -4,15 +4,17 @@ mod color;
 mod db;
 mod error;
 mod health;
+mod hooks;
 mod runner;
 mod schedule;
 mod scheduler;
 mod ui;
 
 use clap::Parser;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, HookCommand};
 use db::Database;
 use error::Result;
+use hooks::HookEvent;
 
 fn main() {
     if let Err(e) = run(Cli::parse()) {
@@ -216,8 +218,85 @@ fn run(cli: Cli) -> Result<()> {
             db.remove_job(&name)?;
             println!("Removed job '{name}'");
         }
+        Commands::Hook { action } => hook_command(&db, action, json, color)?,
     }
 
+    Ok(())
+}
+
+fn hook_command(db: &Database, action: HookCommand, json: bool, color: bool) -> Result<()> {
+    match action {
+        HookCommand::Set { event, command } => {
+            let command = hooks::store_command(&command)?;
+            db.set_hook_command(event.as_str(), Some(&command))?;
+            println!("Set the {} hook: {command}", event.as_str());
+        }
+        HookCommand::Show => {
+            let failure = db.hook_command(HookEvent::Failure.as_str())?;
+            let recovery = db.hook_command(HookEvent::Recovery.as_str())?;
+            if json {
+                ui::print_json(&serde_json::json!({
+                    "on_failure": failure,
+                    "on_recovery": recovery,
+                }))?;
+            } else {
+                let shown = |c: &Option<String>| c.clone().unwrap_or_else(|| "(not set)".into());
+                println!("on failure:  {}", shown(&failure));
+                println!("on recovery: {}", shown(&recovery));
+            }
+        }
+        HookCommand::Clear { event } => {
+            for each in [HookEvent::Failure, HookEvent::Recovery] {
+                if event.is_none_or(|named| named == each) {
+                    db.set_hook_command(each.as_str(), None)?;
+                    println!("Cleared the {} hook", each.as_str());
+                }
+            }
+        }
+        HookCommand::Test { event } => {
+            let outcome = hooks::test(db, event)?;
+            if json {
+                ui::print_json(&serde_json::json!({
+                    "event": event.as_str(),
+                    "status": outcome.status,
+                    "exit_code": outcome.exit_code,
+                    "duration_ms": outcome.duration_ms,
+                    "error": outcome.error,
+                }))?;
+            } else {
+                let status = color::paint(
+                    outcome.status,
+                    if outcome.status == "success" {
+                        color::GREEN
+                    } else {
+                        color::RED
+                    },
+                    color,
+                );
+                let detail = outcome
+                    .error
+                    .as_deref()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default();
+                println!(
+                    "Tested the {} hook: {status} in {}ms{detail}",
+                    event.as_str(),
+                    outcome.duration_ms
+                );
+            }
+            if outcome.status != "success" {
+                std::process::exit(1);
+            }
+        }
+        HookCommand::History { limit } => {
+            let rows = db.hook_history(limit)?;
+            if json {
+                ui::print_json(&rows)?;
+            } else {
+                ui::print_hook_history(&rows, color);
+            }
+        }
+    }
     Ok(())
 }
 

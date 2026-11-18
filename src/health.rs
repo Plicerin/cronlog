@@ -29,7 +29,7 @@ pub struct HealthOptions {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Problem {
-    /// daemon_missing, daemon_stale, disabled, overdue, failing or stuck
+    /// daemon_missing, daemon_stale, disabled, overdue, failing, stuck or hook_failing
     pub kind: &'static str,
     pub job: Option<String>,
     pub message: String,
@@ -159,6 +159,31 @@ pub fn check(db: &Database, now: NaiveDateTime, options: &HealthOptions) -> Resu
                     );
                 }
             }
+        }
+    }
+
+    // A broken alert shouldn't stay silent: report it if the newest hook to run didn't
+    // succeed. Hooks are set for every job, so a `--job` check sees only its own.
+    if let Some(hook) = db.last_finished_hook()? {
+        let ours = options.job.as_deref().is_none_or(|job| job == hook.job);
+        if hook.status != "success" && ours {
+            let when = hook
+                .finished_at
+                .map(|t| format!(" at {}", clock::display(t)))
+                .unwrap_or_default();
+            let detail = hook
+                .error
+                .as_deref()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            problem(
+                "hook_failing",
+                Some(hook.job.as_str()),
+                format!(
+                    "the {} hook for run #{} {}{when}{detail}",
+                    hook.event, hook.run_id, hook.status
+                ),
+            );
         }
     }
 
