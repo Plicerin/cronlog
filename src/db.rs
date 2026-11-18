@@ -106,6 +106,36 @@ pub struct RunResult<'a> {
     pub stderr_truncated: bool,
 }
 
+/// The daemon's last sign of life, written every HEARTBEAT_EVERY.
+#[derive(Debug, Clone)]
+pub struct Heartbeat {
+    pub pid: i64,
+    pub started_at: NaiveDateTime,
+    pub last_tick: NaiveDateTime,
+    pub poll_seconds: i64,
+}
+
+/// A job as `health` checks it.
+#[derive(Debug, Clone)]
+pub struct HealthJob {
+    pub job: Job,
+    pub enabled: bool,
+    /// Finished runs in a row, in completion order, that failed, timed out or were
+    /// interrupted. A success resets it; a skip leaves it. Kept on the job, so pruning
+    /// old runs never shortens it.
+    pub failure_streak: i64,
+}
+
+/// A finished run, as `health` describes it.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub run_id: i64,
+    pub status: String,
+    pub finished_at: Option<NaiveDateTime>,
+    pub exit_code: Option<i64>,
+    pub error: Option<String>,
+}
+
 /// What one prune pass removed.
 #[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct PruneReport {
@@ -237,16 +267,34 @@ impl Database {
                 FOREIGN KEY(run_id) REFERENCES runs(id)
             );
 
+            -- One row: the daemon's last sign of life, for `cronlog health`.
+            CREATE TABLE IF NOT EXISTS daemon_heartbeat (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                pid INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                last_tick TEXT NOT NULL,
+                poll_seconds INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(enabled, next_run_at, deleted_at);
             CREATE INDEX IF NOT EXISTS idx_runs_job_started ON runs(job_id, started_at);
             CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id);
             CREATE INDEX IF NOT EXISTS idx_runs_job_scheduled ON runs(job_id, scheduled_for);
+            -- A job's running runs and its newest failure, without walking its history.
+            CREATE INDEX IF NOT EXISTS idx_runs_job_status ON runs(job_id, status);
             CREATE INDEX IF NOT EXISTS idx_runs_job_trigger_status
                 ON runs(job_id, trigger_type, status, scheduled_for);
             "#,
         )?;
         if !jobs_has_column(&conn, "max_runs")? {
             conn.execute("ALTER TABLE jobs ADD COLUMN max_runs INTEGER", [])?;
+        }
+        if !jobs_has_column(&conn, "failure_streak")? {
+            // Counting starts now; runs recorded before this column are not counted.
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN failure_streak INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         self.convert_times_to_utc(&mut conn, &Local)?;
         Ok(())
@@ -474,6 +522,108 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn record_heartbeat(&self, heartbeat: &Heartbeat) -> Result<()> {
+        self.conn()?.execute(
+            "INSERT INTO daemon_heartbeat (id, pid, started_at, last_tick, poll_seconds)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET pid = ?1, started_at = ?2, last_tick = ?3, poll_seconds = ?4",
+            params![
+                heartbeat.pid,
+                heartbeat.started_at.to_string(),
+                heartbeat.last_tick.to_string(),
+                heartbeat.poll_seconds
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn heartbeat(&self) -> Result<Option<Heartbeat>> {
+        let row = self
+            .conn()?
+            .query_row(
+                "SELECT pid, started_at, last_tick, poll_seconds FROM daemon_heartbeat WHERE id = 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(pid, started_at, last_tick, poll_seconds)| {
+            Some(Heartbeat {
+                pid,
+                started_at: parse_dt_opt(Some(started_at))?,
+                last_tick: parse_dt_opt(Some(last_tick))?,
+                poll_seconds,
+            })
+        }))
+    }
+
+    /// The enabled jobs, or the one named (enabled or not).
+    pub fn health_jobs(&self, name: Option<&str>) -> Result<Vec<HealthJob>> {
+        let conn = self.conn()?;
+        let select =
+            "SELECT id, name, command, schedule, enabled, timeout_seconds, max_runs, next_run_at,
+                    failure_streak
+             FROM jobs WHERE deleted_at IS NULL";
+        let to_health = |row: &rusqlite::Row<'_>| -> rusqlite::Result<HealthJob> {
+            Ok(HealthJob {
+                job: row_to_job(row)?,
+                enabled: row.get::<_, i64>(4)? != 0,
+                failure_streak: row.get(8)?,
+            })
+        };
+        match name {
+            Some(name) => conn
+                .query_row(&format!("{select} AND name = ?1"), params![name], to_health)
+                .optional()?
+                .map(|job| vec![job])
+                .ok_or_else(|| CronlogError::NotFound(format!("job '{name}'"))),
+            None => Ok(conn
+                .prepare(&format!("{select} AND enabled = 1 ORDER BY name"))?
+                .query_map([], to_health)?
+                .collect::<rusqlite::Result<_>>()?),
+        }
+    }
+
+    /// A job's most recently finished failed, timed-out or interrupted run.
+    pub fn last_failure(&self, job_id: i64) -> Result<Option<Outcome>> {
+        Ok(self
+            .conn()?
+            .query_row(
+                "SELECT id, status, finished_at, exit_code, error FROM runs
+                 WHERE job_id = ?1 AND status IN ('failed', 'timed_out', 'interrupted')
+                 ORDER BY finished_at DESC, id DESC LIMIT 1",
+                params![job_id],
+                |r| {
+                    Ok(Outcome {
+                        run_id: r.get(0)?,
+                        status: r.get(1)?,
+                        finished_at: parse_dt_opt(r.get(2)?),
+                        exit_code: r.get(3)?,
+                        error: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// A job's `running` runs: (run id, started at).
+    pub fn running_runs(&self, job_id: i64) -> Result<Vec<(i64, Option<NaiveDateTime>)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, started_at FROM runs WHERE job_id = ?1 AND status = 'running' ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![job_id], |r| {
+            Ok((r.get(0)?, parse_dt_opt(r.get(1)?)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn get_job_by_name(&self, name: &str) -> Result<Job> {
         let conn = self.conn()?;
         conn.query_row(
@@ -596,6 +746,7 @@ impl Database {
         if updated == 0 {
             return Err(CronlogError::NotFound(format!("run {run_id}")));
         }
+        update_failure_streak(&tx, run_id, result.status)?;
         tx.execute(
             "INSERT INTO logs (run_id, stdout, stderr, stdout_truncated, stderr_truncated) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -620,11 +771,14 @@ impl Database {
         exit_code: Option<i64>,
         error: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE runs SET status = ?1, finished_at = ?2, duration_ms = ?3, exit_code = ?4, error = ?5 WHERE id = ?6",
             params![status, finished_at.to_string(), duration_ms, exit_code, error, run_id],
         )?;
+        update_failure_streak(&tx, run_id, status)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -645,6 +799,7 @@ impl Database {
             params![finished_at.to_string(), message, run_id],
         )?;
         if updated > 0 {
+            update_failure_streak(&tx, run_id, "interrupted")?;
             tx.execute(
                 "INSERT INTO logs (run_id, stdout, stderr, stdout_truncated, stderr_truncated) VALUES (?1, '', ?2, 0, 0)",
                 params![run_id, message],
@@ -689,6 +844,7 @@ impl Database {
                 "UPDATE runs SET status = 'interrupted', finished_at = ?1, duration_ms = ?2, error = ?3 WHERE id = ?4",
                 params![finished_at.to_string(), duration_ms, message, run_id],
             )?;
+            update_failure_streak(&tx, run_id, "interrupted")?;
             tx.execute(
                 "INSERT INTO logs (run_id, stdout, stderr, stdout_truncated, stderr_truncated) VALUES (?1, '', ?2, 0, 0)",
                 params![run_id, message],
@@ -1139,6 +1295,20 @@ fn copy_access_list(from: &str, to: &str) -> std::io::Result<()> {
             return Err(std::io::Error::from_raw_os_error(err as i32));
         }
     }
+    Ok(())
+}
+
+/// Count a finished run toward its job's failure streak, in the transaction that
+/// records it, so the streak follows completion order.
+fn update_failure_streak(conn: &Connection, run_id: i64, status: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET failure_streak = CASE
+             WHEN ?2 IN ('failed', 'timed_out', 'interrupted') THEN failure_streak + 1
+             WHEN ?2 = 'success' THEN 0
+             ELSE failure_streak END
+         WHERE id = (SELECT job_id FROM runs WHERE id = ?1)",
+        params![run_id, status],
+    )?;
     Ok(())
 }
 
