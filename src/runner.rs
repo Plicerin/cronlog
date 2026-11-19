@@ -488,6 +488,7 @@ mod tests {
             timeout_seconds,
             max_runs: None,
             next_run_at: None,
+            late_limit_seconds: None,
         }
     }
 

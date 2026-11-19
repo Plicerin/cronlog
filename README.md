@@ -33,7 +33,9 @@ cargo run -- run heartbeat --now
 cargo run -- disable heartbeat
 cargo run -- enable heartbeat
 cargo run -- remove heartbeat
+cargo run -- edit heartbeat --schedule "every 30 seconds" --timeout 1m --late-limit 5m
 cargo run -- prune --older-than 30d --dry-run
+cargo run -- backup ./cronlog-backup.db
 ```
 
 Inspection commands also support `--json` for scripts:
@@ -53,14 +55,33 @@ In a terminal, tables and `health` are coloured: `success` green; `failed`, `tim
 - `every N minute(s)`
 - `every N hour(s)`
 - `daily at HH:MM`, in the machine's local time zone
+- `weekly on <days> at HH:MM`: days as `mon,wed,fri`, a range such as `mon-fri` (ranges may wrap: `fri-mon`), `weekdays`, `weekends`, or a mix
+- `monthly on <day> at HH:MM`: day `1` to `31` (`1st`, `22nd` also work) or `last`. A month without that day runs on its last day, so `monthly on 31` and `monthly on last` both mean month-end
 
 Examples:
 
 ```bash
 cronlog add --name sync --schedule "every 15 minutes" -- ./sync.sh
 cronlog add --name backup --schedule "daily at 02:00" -- ./backup.sh
+cronlog add --name digest --schedule "weekly on mon-fri at 07:00" --late-limit 30m -- ./digest.sh
+cronlog add --name invoices --schedule "monthly on last at 18:00" -- ./invoices.sh
 cronlog add --name pilot --schedule "every 1 hours" --max-runs 12 -- ./pipeline.sh
 ```
+
+`cronlog edit <name>` changes a job's `--schedule`, `--timeout` or `--late-limit` in place, keeping its history. A new schedule starts from now.
+
+## Late slots and catch-up
+
+When Cronlog was not running at a job's slot (a reboot, a stopped WSL), the slot runs once as soon as it is back, and the job then waits for its next future slot; slots in between are not replayed.
+
+For work that is pointless or harmful when late, such as a "today in history" post, give the job a late limit:
+
+```bash
+cronlog add --name today --schedule "daily at 06:00" --late-limit 1h -- ./post_today.sh
+cronlog edit today --late-limit 1h      # on an existing job; `--late-limit none` removes it
+```
+
+A slot that would start more than that late is not run. It's recorded as `skipped` with the reason (`missed: 3h 10m late, past its late limit of 1h`), and the job waits for its next slot. A missed slot is not a failure: it doesn't count toward `health --failures` or fire the failure hook. `cronlog list` shows each job's limit next to its schedule.
 
 ## Defaults
 
@@ -70,11 +91,11 @@ cronlog add --name pilot --schedule "every 1 hours" --max-runs 12 -- ./pipeline.
 - Stdout limit: 256 KB
 - Stderr limit: 256 KB
 - Concurrency: due jobs run in parallel, each on its own thread, so a long job never delays another job
-- Overlap behavior: forbid overlapping runs of the same job. A scheduled slot that comes round while a run is active is recorded as skipped; `cronlog run <name> --now` refuses with an error (exit 1) while a run is active, and `--force` starts another copy anyway
+- Overlap behavior: forbid overlapping runs of the same job. A scheduled slot that comes round while a run is active is recorded as skipped; `cronlog run <name> --now` refuses with an error (exit 1) while a run is active, and `--force` starts another copy anyway. Skips in a row share one history row with a count (`skipped x12`, `skip_count` in JSON): it keeps the first skipped slot as `scheduled_for` and the latest as `finished_at`, so a long run blocking a frequent job doesn't flood the history
 - Output: stdout/stderr are read while the job runs, so large output never blocks it. If a background process the job started keeps them open, Cronlog captures 5 more seconds after the job exits, then closes its end: that process's next write to stdout/stderr fails (on Unix it gets SIGPIPE). Redirect a long-lived background process's output to a file
 - Enabling a job whose next run passed while it was disabled schedules the next future slot instead of running it at once. Interval jobs keep their phase (an `every 10 minutes` job due at 12:00, enabled at 12:35, next runs at 12:40), and enabling and rescheduling happen in one transaction, so the daemon never runs the stale slot
 - Timeouts: kill the job's whole process tree (its process group on Unix, `taskkill /T` on Windows), not only the direct child. Because each job leads its own process group, Ctrl+C on a foreground daemon does not stop running jobs; under systemd, stopping the service stops them
-- Missed runs: run once, then compute the next future run
+- Missed runs: run once, then compute the next future run, unless the job has a `--late-limit` (see Late slots and catch-up)
 - Daemon restart recovery: stale `running` runs are marked `interrupted` with a stderr log, then due jobs can run again normally
 - Worker failure recovery: if a run's worker cannot record its result (a database error or a panic), the daemon marks that run `interrupted` on the next tick, retrying until the database accepts it, so the job's later slots are not skipped
 - Bounded runs: optional `--max-runs N`; scheduled runs that actually start count, manual runs and overlap skips do not
@@ -146,7 +167,7 @@ Each hook run is recorded (`cronlog hook history`, or `--json`), and `cronlog he
 
 ## Times and daylight saving
 
-Cronlog stores every time in UTC and uses local time only to show times and to read a `daily at` schedule:
+Cronlog stores every time in UTC and uses local time only to show times and to read `daily`, `weekly` and `monthly` schedules, which keep their wall-clock time like `daily at` below:
 
 - Interval jobs run at an even real-time pace through clock changes: an `every 5 minutes` job runs every 5 minutes through the night the clocks go back, not pausing for an hour
 - A `daily at` job keeps its wall-clock time, so the day the clocks change it runs 23 or 25 hours after the day before
@@ -156,6 +177,14 @@ Cronlog stores every time in UTC and uses local time only to show times and to r
 - Jobs get `CRONLOG_SCHEDULED_FOR` as local wall-clock time without an offset, as before
 
 A database written by an older Cronlog, which stored local times, is converted to UTC the first time a new Cronlog opens it, after a backup copy is made. See RUNBOOK.md, Backup And Upgrade.
+
+## Backups
+
+```bash
+cronlog backup /mnt/backups/cronlog-$(date +%F).db
+```
+
+Writes a consistent copy of the whole database (SQLite's `VACUUM INTO`), safe while the daemon is running, and compacted. It won't overwrite an existing file unless you pass `--force`. To restore, stop the daemon and copy the backup over the database file.
 
 ## Pruning by hand
 

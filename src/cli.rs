@@ -39,6 +39,36 @@ fn parse_retain(input: &str) -> std::result::Result<Retain, String> {
     }
 }
 
+/// A late limit: a duration such as 30m or 2h, or `none` to run however late.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateLimit {
+    None,
+    After(Duration),
+}
+
+impl LateLimit {
+    pub fn seconds(self) -> Option<i64> {
+        match self {
+            LateLimit::None => None,
+            LateLimit::After(limit) => Some(limit.as_secs() as i64),
+        }
+    }
+}
+
+fn parse_late_limit(input: &str) -> std::result::Result<LateLimit, String> {
+    let trimmed = input.trim();
+    match trimmed.to_lowercase().as_str() {
+        "none" | "off" => Ok(LateLimit::None),
+        _ => {
+            let limit = humantime::parse_duration(trimmed).map_err(|e| e.to_string())?;
+            if limit.as_secs() == 0 {
+                return Err("a late limit must be at least 1s, or `none`".into());
+            }
+            Ok(LateLimit::After(limit))
+        }
+    }
+}
+
 fn parse_age(input: &str) -> std::result::Result<Duration, String> {
     match parse_retain(input)? {
         Retain::For(duration) => Ok(duration),
@@ -66,6 +96,18 @@ mod tests {
         assert!(parse_retain("0s").is_err());
         assert!(parse_retain("soon").is_err());
         assert!(parse_age("forever").is_err());
+    }
+
+    #[test]
+    fn late_limit_takes_a_duration_or_none() {
+        assert_eq!(
+            parse_late_limit("30m").map(LateLimit::seconds),
+            Ok(Some(1800))
+        );
+        assert_eq!(parse_late_limit("None"), Ok(LateLimit::None));
+        assert!(parse_late_limit("0s").is_err());
+        assert!(parse_late_limit("500ms").is_err());
+        assert!(parse_late_limit("soonish").is_err());
     }
 }
 
@@ -133,7 +175,9 @@ pub enum Commands {
         #[arg(short, long)]
         name: String,
 
-        /// Schedule: "every N seconds", "every N minutes", "every N hours", or "daily at HH:MM"
+        /// Schedule: "every N seconds/minutes/hours", "daily at HH:MM", "weekly on
+        /// mon,fri at HH:MM" (or mon-fri, weekdays, weekends), or "monthly on 1 at HH:MM"
+        /// (1-31 or last; a short month uses its last day)
         #[arg(short, long)]
         schedule: String,
 
@@ -145,9 +189,33 @@ pub enum Commands {
         #[arg(long, value_parser = parse_positive_i64)]
         max_runs: Option<i64>,
 
+        /// Skip a slot that would start later than this (after downtime, say) and wait
+        /// for the next one, recording it as missed. Without it, a late slot still runs
+        /// once
+        #[arg(long, value_parser = parse_late_limit)]
+        late_limit: Option<LateLimit>,
+
         /// Command and arguments to run. Put this after --
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+
+    /// Change a job's schedule, timeout or late limit. A new schedule starts from now
+    Edit {
+        /// Job name
+        name: String,
+
+        /// New schedule, in any form `add` takes
+        #[arg(short, long)]
+        schedule: Option<String>,
+
+        /// New timeout, for example 30s, 5m, 1h
+        #[arg(long, value_parser = parse_duration)]
+        timeout: Option<Duration>,
+
+        /// New late limit, for example 30m, or `none` to run however late
+        #[arg(long, value_parser = parse_late_limit)]
+        late_limit: Option<LateLimit>,
     },
 
     /// List registered jobs
@@ -216,6 +284,16 @@ pub enum Commands {
         /// large file
         #[arg(long)]
         vacuum: bool,
+    },
+
+    /// Copy the database to a file: a consistent snapshot, safe while the daemon runs
+    Backup {
+        /// Where to write the copy
+        path: std::path::PathBuf,
+
+        /// Replace the file if it exists
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show run history for a job

@@ -300,6 +300,14 @@ pub fn dispatch_due_jobs(
                     job.name
                 );
             }
+            RunClaim::Missed(_, late) => {
+                println!(
+                    "Missed '{}' slot at {}: {} late, past its late limit",
+                    job.name,
+                    clock::display(scheduled_for),
+                    clock::format_seconds(late.num_seconds())
+                );
+            }
             RunClaim::NotDue => {}
         }
     }
@@ -525,6 +533,7 @@ mod tests {
             timeout_seconds: 3600,
             max_runs: None,
             next_run_at: None,
+            late_limit_seconds: None,
         }
     }
 

@@ -35,6 +35,7 @@ fn run(cli: Cli) -> Result<()> {
             schedule,
             timeout,
             max_runs,
+            late_limit,
             command,
         } => {
             if command.is_empty() {
@@ -45,13 +46,14 @@ fn run(cli: Cli) -> Result<()> {
             let parsed = schedule::parse_schedule(&schedule)?;
             let next_run_at = parsed.next_after(clock::now())?;
             let timeout_seconds = timeout.map(|d| d.as_secs() as i64).unwrap_or(3600);
-            db.add_job(
+            db.add_job_with_late_limit(
                 &name,
                 &command,
                 &schedule,
                 timeout_seconds,
                 max_runs,
                 next_run_at,
+                late_limit.and_then(cli::LateLimit::seconds),
             )?;
             match max_runs {
                 Some(limit) => println!(
@@ -63,6 +65,66 @@ fn run(cli: Cli) -> Result<()> {
                     clock::display(next_run_at)
                 ),
             }
+        }
+        Commands::Edit {
+            name,
+            schedule,
+            timeout,
+            late_limit,
+        } => {
+            if schedule.is_none() && timeout.is_none() && late_limit.is_none() {
+                return Err(error::CronlogError::InvalidCommand(
+                    "nothing to change: give --schedule, --timeout or --late-limit".into(),
+                ));
+            }
+            if let Some(schedule) = &schedule {
+                schedule::parse_schedule(schedule)?;
+            }
+            let change = db::JobEdit {
+                schedule: schedule.clone(),
+                timeout_seconds: timeout.map(|d| d.as_secs().max(1) as i64),
+                late_limit_seconds: late_limit.map(cli::LateLimit::seconds),
+            };
+            let next = db.edit_job(&name, &change, |schedule| {
+                schedule::parse_schedule(schedule)?.next_after(clock::now())
+            })?;
+            let mut changed = Vec::new();
+            if let Some(schedule) = schedule {
+                changed.push(format!("schedule '{schedule}'"));
+            }
+            if let Some(timeout) = timeout {
+                changed.push(format!("timeout {}", humantime::format_duration(timeout)));
+            }
+            match late_limit {
+                Some(cli::LateLimit::After(limit)) => {
+                    changed.push(format!("late limit {}", humantime::format_duration(limit)))
+                }
+                Some(cli::LateLimit::None) => changed.push("no late limit".into()),
+                None => {}
+            }
+            let next = next
+                .map(|t| format!(", next run {}", clock::display(t)))
+                .unwrap_or_default();
+            println!("Updated job '{name}': {}{next}", changed.join(", "));
+        }
+        Commands::Backup { path, force } => {
+            if path.exists() {
+                if !force {
+                    return Err(error::CronlogError::InvalidCommand(format!(
+                        "{} already exists; use --force to replace it",
+                        path.display()
+                    )));
+                }
+                std::fs::remove_file(&path)?;
+            }
+            db.backup_to(&path)?;
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "Backed up {} to {} ({} KB)",
+                cli.db,
+                path.display(),
+                size.div_ceil(1024)
+            );
         }
         Commands::List => {
             let jobs = db.list_jobs()?;

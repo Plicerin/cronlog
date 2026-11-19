@@ -15,6 +15,9 @@ pub struct Job {
     pub max_runs: Option<i64>,
     #[serde(serialize_with = "clock::serialize_local")]
     pub next_run_at: Option<NaiveDateTime>,
+    /// A scheduled run starting later than this after its slot is recorded as missed
+    /// instead; `None` runs it however late.
+    pub late_limit_seconds: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -28,6 +31,7 @@ pub struct JobListRow {
     pub max_runs: Option<i64>,
     pub scheduled_runs: i64,
     pub remaining_runs: Option<i64>,
+    pub late_limit_seconds: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,6 +48,9 @@ pub struct HistoryRow {
     pub duration_ms: Option<i64>,
     pub exit_code: Option<i64>,
     pub error: Option<String>,
+    /// How many slots in a row this `skipped` row stands for (overlap skips are
+    /// collapsed into one row; `finished_at` is the latest).
+    pub skip_count: i64,
 }
 
 /// Hook events, as stored in `hook_runs.event` and in the settings keys.
@@ -127,7 +134,22 @@ pub enum ManualClaim {
 pub enum RunClaim {
     Claimed(i64),
     Skipped(i64),
+    /// The slot was later than the job's late limit: recorded as skipped, not run.
+    /// Holds the run id and how late it was.
+    Missed(i64, chrono::Duration),
     NotDue,
+}
+
+/// The error text of an overlap skip, which consecutive skips collapse on.
+const STILL_ACTIVE: &str = "previous run still active";
+
+/// Changes made by `cronlog edit`; `None` leaves a field as it is.
+#[derive(Debug, Default)]
+pub struct JobEdit {
+    pub schedule: Option<String>,
+    pub timeout_seconds: Option<i64>,
+    /// `Some(None)` removes the limit.
+    pub late_limit_seconds: Option<Option<i64>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -412,6 +434,15 @@ impl Database {
         if !jobs_has_column(&conn, "max_runs")? {
             conn.execute("ALTER TABLE jobs ADD COLUMN max_runs INTEGER", [])?;
         }
+        if !jobs_has_column(&conn, "late_limit_seconds")? {
+            conn.execute("ALTER TABLE jobs ADD COLUMN late_limit_seconds INTEGER", [])?;
+        }
+        if !table_has_column(&conn, "runs", "skip_count")? {
+            conn.execute(
+                "ALTER TABLE runs ADD COLUMN skip_count INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
         if !jobs_has_column(&conn, "failure_streak")? {
             // Counting starts now; runs recorded before this column are not counted.
             conn.execute(
@@ -519,6 +550,8 @@ impl Database {
         )))
     }
 
+    /// `add_job_with_late_limit` with no late limit.
+    #[cfg(test)]
     pub fn add_job(
         &self,
         name: &str,
@@ -528,12 +561,94 @@ impl Database {
         max_runs: Option<i64>,
         next_run_at: NaiveDateTime,
     ) -> Result<()> {
+        self.add_job_with_late_limit(
+            name,
+            command,
+            schedule,
+            timeout_seconds,
+            max_runs,
+            next_run_at,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_job_with_late_limit(
+        &self,
+        name: &str,
+        command: &[String],
+        schedule: &str,
+        timeout_seconds: i64,
+        max_runs: Option<i64>,
+        next_run_at: NaiveDateTime,
+        late_limit_seconds: Option<i64>,
+    ) -> Result<()> {
         let conn = self.conn()?;
         let command_joined = shell_words::join(command.iter().map(String::as_str));
         conn.execute(
-            "INSERT INTO jobs (name, command, schedule, timeout_seconds, max_runs, next_run_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![name, command_joined, schedule, timeout_seconds, max_runs, next_run_at.to_string()],
+            "INSERT INTO jobs (name, command, schedule, timeout_seconds, max_runs, next_run_at, late_limit_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![name, command_joined, schedule, timeout_seconds, max_runs, next_run_at.to_string(), late_limit_seconds],
         )?;
+        Ok(())
+    }
+
+    /// Apply `cronlog edit`. A new schedule moves the next run to `next_for(schedule)`,
+    /// unless the job has no next run (disabled by `--max-runs`), in one transaction.
+    pub fn edit_job<F>(
+        &self,
+        name: &str,
+        change: &JobEdit,
+        next_for: F,
+    ) -> Result<Option<NaiveDateTime>>
+    where
+        F: FnOnce(&str) -> Result<NaiveDateTime>,
+    {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_next: Option<String> = tx
+            .query_row(
+                "SELECT next_run_at FROM jobs WHERE name = ?1 AND deleted_at IS NULL",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| CronlogError::NotFound(format!("job '{name}'")))?;
+        let mut next = parse_dt_opt(current_next);
+        if let Some(schedule) = &change.schedule {
+            if next.is_some() {
+                next = Some(next_for(schedule)?);
+            }
+            tx.execute(
+                "UPDATE jobs SET schedule = ?1, next_run_at = ?2, updated_at = CURRENT_TIMESTAMP WHERE name = ?3 AND deleted_at IS NULL",
+                params![schedule, next.map(|t| t.to_string()), name],
+            )?;
+        }
+        if let Some(timeout) = change.timeout_seconds {
+            tx.execute(
+                "UPDATE jobs SET timeout_seconds = ?1, updated_at = CURRENT_TIMESTAMP WHERE name = ?2 AND deleted_at IS NULL",
+                params![timeout, name],
+            )?;
+        }
+        if let Some(limit) = change.late_limit_seconds {
+            tx.execute(
+                "UPDATE jobs SET late_limit_seconds = ?1, updated_at = CURRENT_TIMESTAMP WHERE name = ?2 AND deleted_at IS NULL",
+                params![limit, name],
+            )?;
+        }
+        tx.commit()?;
+        Ok(next)
+    }
+
+    /// Write a consistent copy of the whole database to `path` (SQLite's VACUUM INTO),
+    /// safe while the daemon is running. `path` must not exist.
+    pub fn backup_to(&self, path: &Path) -> Result<()> {
+        let target = path.to_str().ok_or_else(|| {
+            CronlogError::InvalidCommand(format!(
+                "backup path is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+        self.conn()?.execute("VACUUM INTO ?1", params![target])?;
         Ok(())
     }
 
@@ -541,7 +656,8 @@ impl Database {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT j.name, j.command, j.schedule, j.enabled, j.next_run_at, j.max_runs,
-                    (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.trigger_type = 'schedule' AND rr.status NOT IN ('running', 'skipped')) AS scheduled_runs
+                    (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.trigger_type = 'schedule' AND rr.status NOT IN ('running', 'skipped')) AS scheduled_runs,
+                    j.late_limit_seconds
              FROM jobs j
              WHERE j.deleted_at IS NULL
              ORDER BY j.name"
@@ -557,6 +673,7 @@ impl Database {
                 max_runs: row.get(5)?,
                 scheduled_runs: row.get(6)?,
                 remaining_runs: remaining_runs(row.get(5)?, row.get(6)?),
+                late_limit_seconds: row.get(7)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -635,7 +752,7 @@ impl Database {
     pub fn get_due_jobs(&self, now: NaiveDateTime) -> Result<Vec<Job>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, command, schedule, enabled, timeout_seconds, max_runs, next_run_at
+            "SELECT id, name, command, schedule, enabled, timeout_seconds, max_runs, next_run_at, late_limit_seconds
              FROM jobs
              WHERE enabled = 1 AND deleted_at IS NULL AND next_run_at IS NOT NULL AND next_run_at <= ?1
              ORDER BY next_run_at ASC"
@@ -690,14 +807,14 @@ impl Database {
     pub fn health_jobs(&self, name: Option<&str>) -> Result<Vec<HealthJob>> {
         let conn = self.conn()?;
         let select =
-            "SELECT id, name, command, schedule, enabled, timeout_seconds, max_runs, next_run_at,
+            "SELECT id, name, command, schedule, enabled, timeout_seconds, max_runs, next_run_at, late_limit_seconds,
                     failure_streak
              FROM jobs WHERE deleted_at IS NULL";
         let to_health = |row: &rusqlite::Row<'_>| -> rusqlite::Result<HealthJob> {
             Ok(HealthJob {
                 job: row_to_job(row)?,
                 enabled: row.get::<_, i64>(4)? != 0,
-                failure_streak: row.get(8)?,
+                failure_streak: row.get(9)?,
             })
         };
         match name {
@@ -750,7 +867,7 @@ impl Database {
     pub fn get_job_by_name(&self, name: &str) -> Result<Job> {
         let conn = self.conn()?;
         conn.query_row(
-            "SELECT id, name, command, schedule, enabled, timeout_seconds, max_runs, next_run_at FROM jobs WHERE name = ?1 AND deleted_at IS NULL",
+            "SELECT id, name, command, schedule, enabled, timeout_seconds, max_runs, next_run_at, late_limit_seconds FROM jobs WHERE name = ?1 AND deleted_at IS NULL",
             params![name],
             row_to_job,
         ).optional()?.ok_or_else(|| CronlogError::NotFound(format!("job '{name}'")))
@@ -769,7 +886,8 @@ impl Database {
         let job_state = tx
             .query_row(
                 "SELECT j.next_run_at, j.max_runs,
-                        (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.trigger_type = 'schedule' AND rr.status NOT IN ('running', 'skipped')) AS scheduled_runs
+                        (SELECT COUNT(*) FROM runs rr WHERE rr.job_id = j.id AND rr.trigger_type = 'schedule' AND rr.status NOT IN ('running', 'skipped')) AS scheduled_runs,
+                        j.late_limit_seconds
                  FROM jobs j
                  WHERE j.id = ?1 AND j.enabled = 1 AND j.deleted_at IS NULL",
                 params![job_id],
@@ -778,12 +896,13 @@ impl Database {
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, Option<i64>>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
                     ))
                 },
             )
             .optional()?;
 
-        let Some((current_next, max_runs, scheduled_runs)) = job_state else {
+        let Some((current_next, max_runs, scheduled_runs, late_limit)) = job_state else {
             tx.commit()?;
             return Ok(RunClaim::NotDue);
         };
@@ -808,13 +927,60 @@ impl Database {
             |row| row.get(0),
         )?;
 
-        let claim = if running_count > 0 {
+        let late = started_at - scheduled_for;
+        let missed = late_limit.is_some_and(|limit| late > chrono::Duration::seconds(limit));
+
+        let claim = if missed {
+            // Too late to be useful (a "this day" post after midnight): record the
+            // slot and wait for the next one.
+            let limit = late_limit.unwrap_or_default();
             tx.execute(
                 "INSERT INTO runs (job_id, status, scheduled_for, finished_at, duration_ms, trigger_type, error)
-                 VALUES (?1, 'skipped', ?2, ?3, 0, 'schedule', 'previous run still active')",
-                params![job_id, scheduled_for.to_string(), started_at.to_string()],
+                 VALUES (?1, 'skipped', ?2, ?3, 0, 'schedule', ?4)",
+                params![
+                    job_id,
+                    scheduled_for.to_string(),
+                    started_at.to_string(),
+                    format!(
+                        "missed: {} late, past its late limit of {}",
+                        crate::clock::format_seconds(late.num_seconds()),
+                        crate::clock::format_seconds(limit)
+                    )
+                ],
             )?;
-            RunClaim::Skipped(tx.last_insert_rowid())
+            RunClaim::Missed(tx.last_insert_rowid(), late)
+        } else if running_count > 0 {
+            // Consecutive overlap skips share one row, counted, rather than one row
+            // per slot while a long run blocks a frequent schedule.
+            let latest: Option<(i64, String, String, Option<String>)> = tx
+                .query_row(
+                    "SELECT id, status, trigger_type, error FROM runs
+                     WHERE job_id = ?1 ORDER BY scheduled_for DESC, id DESC LIMIT 1",
+                    params![job_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            match latest {
+                Some((id, status, trigger, error))
+                    if status == "skipped"
+                        && trigger == "schedule"
+                        && error.as_deref() == Some(STILL_ACTIVE) =>
+                {
+                    tx.execute(
+                        "UPDATE runs SET skip_count = skip_count + 1, finished_at = ?1 WHERE id = ?2",
+                        params![started_at.to_string(), id],
+                    )?;
+                    RunClaim::Skipped(id)
+                }
+                _ => {
+                    tx.execute(
+                        "INSERT INTO runs (job_id, status, scheduled_for, finished_at, duration_ms, trigger_type, error)
+                         VALUES (?1, 'skipped', ?2, ?3, 0, 'schedule', ?4)",
+                        params![job_id, scheduled_for.to_string(), started_at.to_string(), STILL_ACTIVE],
+                    )?;
+                    RunClaim::Skipped(tx.last_insert_rowid())
+                }
+            }
         } else {
             tx.execute(
                 "INSERT INTO runs (job_id, status, scheduled_for, started_at, trigger_type)
@@ -1396,7 +1562,7 @@ impl Database {
     pub fn history(&self, name: &str, limit: i64) -> Result<Vec<HistoryRow>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT r.id, r.status, r.trigger_type, r.scheduled_for, r.started_at, r.finished_at, r.duration_ms, r.exit_code, r.error
+            "SELECT r.id, r.status, r.trigger_type, r.scheduled_for, r.started_at, r.finished_at, r.duration_ms, r.exit_code, r.error, r.skip_count
              FROM runs r JOIN jobs j ON j.id = r.job_id
              WHERE j.name = ?1
              ORDER BY r.id DESC LIMIT ?2"
@@ -1412,6 +1578,7 @@ impl Database {
                 duration_ms: row.get(6)?,
                 exit_code: row.get(7)?,
                 error: row.get(8)?,
+                skip_count: row.get(9)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1476,6 +1643,7 @@ fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         timeout_seconds: row.get(5)?,
         max_runs: row.get(6)?,
         next_run_at: parse_dt_opt(next),
+        late_limit_seconds: row.get(8)?,
     })
 }
 
@@ -1690,7 +1858,11 @@ fn remaining_runs(max_runs: Option<i64>, scheduled_runs: i64) -> Option<i64> {
 }
 
 fn jobs_has_column(conn: &Connection, column: &str) -> Result<bool> {
-    let mut stmt = conn.prepare("PRAGMA table_info(jobs)")?;
+    table_has_column(conn, "jobs", column)
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
     for existing in columns {
         if existing? == column {
@@ -2082,6 +2254,211 @@ mod tests {
             ManualClaim::Started(_)
         ));
 
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn consecutive_overlap_skips_share_one_counted_row() {
+        let db = test_db();
+        let when = fixed_time();
+        let secs = chrono::Duration::seconds;
+        db.add_job(
+            "heartbeat",
+            &["echo".into()],
+            "every 10 seconds",
+            3600,
+            None,
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("heartbeat").expect("get job");
+        let blocking = db
+            .create_run(job.id, "running", when, Some(when), "schedule")
+            .expect("create active run");
+
+        let mut slot = when;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let RunClaim::Skipped(id) = db
+                .claim_scheduled_run(job.id, slot, slot + secs(10), slot)
+                .expect("claim")
+            else {
+                panic!("expected a skip");
+            };
+            ids.push(id);
+            slot += secs(10);
+        }
+        assert!(ids.iter().all(|id| *id == ids[0]), "one row: {ids:?}");
+        let history = db.history("heartbeat", 10).expect("history");
+        let skipped = history.iter().find(|r| r.run_id == ids[0]).expect("row");
+        assert_eq!(skipped.skip_count, 3);
+        assert_eq!(skipped.scheduled_for, Some(when), "first slot kept");
+        assert_eq!(skipped.finished_at, Some(when + secs(20)), "latest skip");
+
+        // Once a new run starts, the next skip begins a new row.
+        db.record_result(
+            blocking,
+            &RunResult {
+                status: "success",
+                finished_at: slot,
+                duration_ms: 1,
+                exit_code: Some(0),
+                error: None,
+                stdout: "",
+                stderr: "",
+                stdout_truncated: false,
+                stderr_truncated: false,
+                stderr_tail: None,
+            },
+        )
+        .expect("finish");
+        let RunClaim::Claimed(_) = db
+            .claim_scheduled_run(job.id, slot, slot + secs(10), slot)
+            .expect("claim run")
+        else {
+            panic!("expected a run");
+        };
+        slot += secs(10);
+        let RunClaim::Skipped(next) = db
+            .claim_scheduled_run(job.id, slot, slot + secs(10), slot)
+            .expect("claim")
+        else {
+            panic!("expected a skip");
+        };
+        assert_ne!(next, ids[0]);
+
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn a_slot_past_the_late_limit_is_missed_not_run() {
+        let db = test_db();
+        let when = fixed_time();
+        let mins = chrono::Duration::minutes;
+        db.add_job_with_late_limit(
+            "digest",
+            &["echo".into()],
+            "daily at 07:00",
+            3600,
+            None,
+            when,
+            Some(30 * 60),
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("digest").expect("get job");
+        assert_eq!(job.late_limit_seconds, Some(1800));
+
+        // Ten minutes late: within the limit, so it runs.
+        assert!(matches!(
+            db.claim_scheduled_run(job.id, when, when + mins(1440), when + mins(10))
+                .expect("claim"),
+            RunClaim::Claimed(_)
+        ));
+
+        // The next day the daemon is back two hours late: missed, and the job moves on.
+        let tomorrow = when + mins(1440);
+        let RunClaim::Missed(id, late) = db
+            .claim_scheduled_run(
+                job.id,
+                tomorrow,
+                tomorrow + mins(1440),
+                tomorrow + mins(120),
+            )
+            .expect("claim")
+        else {
+            panic!("expected a missed slot");
+        };
+        assert_eq!(late, mins(120));
+        let history = db.history("digest", 10).expect("history");
+        let missed = history.iter().find(|r| r.run_id == id).expect("row");
+        assert_eq!(missed.status, "skipped");
+        assert_eq!(
+            missed.error.as_deref(),
+            Some("missed: 2h late, past its late limit of 30m")
+        );
+        assert_eq!(
+            db.get_job_by_name("digest").expect("job").next_run_at,
+            Some(tomorrow + mins(1440))
+        );
+        // A missed slot isn't a failure.
+        assert_eq!(
+            db.health_jobs(Some("digest")).expect("health")[0].failure_streak,
+            0
+        );
+
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn edit_changes_only_what_is_given() {
+        let db = test_db();
+        let when = fixed_time();
+        db.add_job(
+            "report",
+            &["echo".into()],
+            "every 10 minutes",
+            60,
+            None,
+            when,
+        )
+        .expect("add job");
+
+        let next = when + chrono::Duration::hours(5);
+        let change = JobEdit {
+            late_limit_seconds: Some(Some(900)),
+            ..JobEdit::default()
+        };
+        let moved = db
+            .edit_job("report", &change, |_| panic!("schedule unchanged"))
+            .expect("edit");
+        assert_eq!(moved, Some(when), "next run kept");
+        let job = db.get_job_by_name("report").expect("job");
+        assert_eq!(
+            (job.timeout_seconds, job.late_limit_seconds),
+            (60, Some(900))
+        );
+
+        let change = JobEdit {
+            schedule: Some("weekly on mon at 07:00".into()),
+            timeout_seconds: Some(120),
+            late_limit_seconds: Some(None),
+        };
+        let moved = db.edit_job("report", &change, |_| Ok(next)).expect("edit");
+        assert_eq!(moved, Some(next));
+        let job = db.get_job_by_name("report").expect("job");
+        assert_eq!(job.schedule, "weekly on mon at 07:00");
+        assert_eq!(job.next_run_at, Some(next));
+        assert_eq!((job.timeout_seconds, job.late_limit_seconds), (120, None));
+
+        assert!(db.edit_job("nope", &change, |_| Ok(next)).is_err());
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
+    fn backup_writes_a_readable_copy() {
+        let db = test_db();
+        let when = fixed_time();
+        db.add_job(
+            "report",
+            &["echo".into()],
+            "every 10 minutes",
+            60,
+            None,
+            when,
+        )
+        .expect("add job");
+        let copy_path = std::path::PathBuf::from(format!("{}.backup", db.path));
+        let _ = fs::remove_file(&copy_path);
+
+        db.backup_to(&copy_path).expect("backup");
+        let copy = Database::open(copy_path.to_str().unwrap()).expect("open copy");
+        assert_eq!(
+            copy.get_job_by_name("report").expect("job").timeout_seconds,
+            60
+        );
+        assert!(db.backup_to(&copy_path).is_err(), "won't overwrite");
+
+        let _ = fs::remove_file(&copy_path);
         let _ = fs::remove_file(db.path);
     }
 
