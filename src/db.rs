@@ -470,17 +470,19 @@ impl Database {
             ] {
                 if !table_has_column(&tx, table, column)? {
                     tx.execute(ddl, [])?;
+                    if column == "timeout_seconds" {
+                        // Once, as the column arrives: runs still going from before
+                        // get their job's current timeout, so a later `cronlog edit`
+                        // can't change what they're checked against.
+                        tx.execute(
+                            "UPDATE runs SET timeout_seconds =
+                                 (SELECT timeout_seconds FROM jobs WHERE jobs.id = runs.job_id)
+                             WHERE status = 'running'",
+                            [],
+                        )?;
+                    }
                 }
             }
-            // Runs still going from before runs recorded their timeout get the job's
-            // current one now, so a later `cronlog edit` can't change what they're
-            // checked against.
-            tx.execute(
-                "UPDATE runs SET timeout_seconds =
-                     (SELECT timeout_seconds FROM jobs WHERE jobs.id = runs.job_id)
-                 WHERE status = 'running' AND timeout_seconds IS NULL",
-                [],
-            )?;
             tx.commit()?;
         }
         self.convert_times_to_utc(&mut conn, &Local)?;
@@ -2695,13 +2697,11 @@ mod tests {
         );
         assert_eq!(db.get_job_by_name("report").unwrap().timeout_seconds, 5);
 
-        // A run from before runs recorded their timeout gets its job's on the next open.
+        // A run from before runs recorded their timeout gets its job's when the column
+        // is added.
         db.conn()
             .unwrap()
-            .execute(
-                "UPDATE runs SET timeout_seconds = NULL WHERE id = ?1",
-                params![run],
-            )
+            .execute("ALTER TABLE runs DROP COLUMN timeout_seconds", [])
             .unwrap();
         let reopened = Database::open(&db.path).expect("reopen");
         reopened.init().expect("init");
