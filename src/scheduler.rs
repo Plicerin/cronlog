@@ -271,7 +271,7 @@ pub fn dispatch_due_jobs(
         let scheduled_for = job.next_run_at.unwrap_or(now);
         let next_run_at = next_run_after_scheduled_time(&job, scheduled_for, now)?;
 
-        match db.claim_scheduled_run(job.id, scheduled_for, next_run_at, clock::now())? {
+        match db.claim_scheduled_run_at(job.id, scheduled_for, next_run_at, clock::now)? {
             RunClaim::Claimed(run_id) => {
                 let db = db.clone();
                 let orphans = Arc::clone(orphans);

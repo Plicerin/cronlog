@@ -434,28 +434,45 @@ impl Database {
                 WHERE status NOT IN ('pending', 'running', 'skipped');
             "#,
         )?;
-        if !jobs_has_column(&conn, "max_runs")? {
-            conn.execute("ALTER TABLE jobs ADD COLUMN max_runs INTEGER", [])?;
-        }
-        if !jobs_has_column(&conn, "late_limit_seconds")? {
-            conn.execute("ALTER TABLE jobs ADD COLUMN late_limit_seconds INTEGER", [])?;
-        }
-        if !table_has_column(&conn, "runs", "timeout_seconds")? {
-            // The timeout a run was started with; NULL for runs from before this column.
-            conn.execute("ALTER TABLE runs ADD COLUMN timeout_seconds INTEGER", [])?;
-        }
-        if !table_has_column(&conn, "runs", "skip_count")? {
-            conn.execute(
-                "ALTER TABLE runs ADD COLUMN skip_count INTEGER NOT NULL DEFAULT 1",
-                [],
-            )?;
-        }
-        if !jobs_has_column(&conn, "failure_streak")? {
-            // Counting starts now; runs recorded before this column are not counted.
-            conn.execute(
-                "ALTER TABLE jobs ADD COLUMN failure_streak INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
+        // Columns added since the first release. Checked and added under the write lock,
+        // so two commands opening a database at once (the daemon and a CLI call after an
+        // upgrade) can't both add one and fail on the duplicate.
+        {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for (table, column, ddl) in [
+                (
+                    "jobs",
+                    "max_runs",
+                    "ALTER TABLE jobs ADD COLUMN max_runs INTEGER",
+                ),
+                (
+                    "jobs",
+                    "late_limit_seconds",
+                    "ALTER TABLE jobs ADD COLUMN late_limit_seconds INTEGER",
+                ),
+                // Counting starts now; runs recorded before this column are not counted.
+                (
+                    "jobs",
+                    "failure_streak",
+                    "ALTER TABLE jobs ADD COLUMN failure_streak INTEGER NOT NULL DEFAULT 0",
+                ),
+                // The timeout a run was started with; NULL for runs from before it.
+                (
+                    "runs",
+                    "timeout_seconds",
+                    "ALTER TABLE runs ADD COLUMN timeout_seconds INTEGER",
+                ),
+                (
+                    "runs",
+                    "skip_count",
+                    "ALTER TABLE runs ADD COLUMN skip_count INTEGER NOT NULL DEFAULT 1",
+                ),
+            ] {
+                if !table_has_column(&tx, table, column)? {
+                    tx.execute(ddl, [])?;
+                }
+            }
+            tx.commit()?;
         }
         self.convert_times_to_utc(&mut conn, &Local)?;
         Ok(())
@@ -658,28 +675,32 @@ impl Database {
                 path.display()
             ))
         })?;
-        if path.exists() {
-            if same_file(path, Path::new(&self.path)) {
-                return Err(CronlogError::InvalidCommand(format!(
-                    "{} is the database itself; back it up to another file",
-                    path.display()
-                )));
-            }
-            if !force {
-                return Err(CronlogError::InvalidCommand(format!(
-                    "{} already exists; use --force to replace it",
-                    path.display()
-                )));
-            }
-            std::fs::remove_file(path)?;
+        if is_database_file(path, Path::new(&self.path)) {
+            return Err(CronlogError::InvalidCommand(format!(
+                "{} is the database or one of its working files; back it up to another file",
+                path.display()
+            )));
         }
+        if path.exists() && !force {
+            return Err(CronlogError::InvalidCommand(format!(
+                "{} already exists; use --force to replace it",
+                path.display()
+            )));
+        }
+        // Copy to a new file beside the target, then move it into place, so a copy that
+        // fails (a busy database, a full disk) leaves any earlier backup as it was.
         // VACUUM INTO writes into an empty file it finds, keeping its permissions.
-        create_backup_file(target, &self.path)?;
-        if let Err(err) = self.conn()?.execute("VACUUM INTO ?1", params![target]) {
-            let _ = std::fs::remove_file(path);
-            return Err(err.into());
+        let partial = format!("{target}.partial-{}", std::process::id());
+        let _ = std::fs::remove_file(&partial); // left by an earlier crash of this pid
+        create_backup_file(&partial, &self.path)?;
+        let copied = self
+            .conn()
+            .and_then(|conn| Ok(conn.execute("VACUUM INTO ?1", params![partial])?))
+            .and_then(|_| Ok(std::fs::rename(&partial, path)?));
+        if copied.is_err() {
+            let _ = std::fs::remove_file(&partial);
         }
-        Ok(())
+        copied.map(|_| ())
     }
 
     pub fn list_jobs(&self) -> Result<Vec<JobListRow>> {
@@ -919,6 +940,8 @@ impl Database {
         ).optional()?.ok_or_else(|| CronlogError::NotFound(format!("job '{name}'")))
     }
 
+    /// `claim_scheduled_run_at` with a fixed start time.
+    #[cfg(test)]
     pub fn claim_scheduled_run(
         &self,
         job_id: i64,
@@ -926,8 +949,22 @@ impl Database {
         next_run_at: NaiveDateTime,
         started_at: NaiveDateTime,
     ) -> Result<RunClaim> {
+        self.claim_scheduled_run_at(job_id, scheduled_for, next_run_at, || started_at)
+    }
+
+    /// Claim a due slot: run it, skip it (a run is still active), or record it missed
+    /// (past the job's late limit). `now` is read once the write lock is held, so time
+    /// spent waiting for another writer counts toward the late limit.
+    pub fn claim_scheduled_run_at(
+        &self,
+        job_id: i64,
+        scheduled_for: NaiveDateTime,
+        next_run_at: NaiveDateTime,
+        now: impl FnOnce() -> NaiveDateTime,
+    ) -> Result<RunClaim> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let started_at = now();
 
         let job_state = tx
             .query_row(
@@ -1728,6 +1765,32 @@ fn prune_targets(conn: &Connection, keep_last: i64) -> Result<Vec<PruneTarget>> 
     Ok(targets)
 }
 
+/// Whether `path` is the database at `db` or one of SQLite's files beside it
+/// (`-journal`, `-wal`, `-shm`), existing yet or not.
+fn is_database_file(path: &Path, db: &Path) -> bool {
+    if path.exists() && same_file(path, db) {
+        return true;
+    }
+    let dir = |p: &Path| {
+        let parent = p.parent().filter(|d| !d.as_os_str().is_empty());
+        std::fs::canonicalize(parent.unwrap_or(Path::new(".")))
+    };
+    let (Ok(path_dir), Ok(db_dir), Some(name), Some(db_name)) =
+        (dir(path), dir(db), path.file_name(), db.file_name())
+    else {
+        return false;
+    };
+    if path_dir != db_dir {
+        return false;
+    }
+    let fold = |s: String| if cfg!(windows) { s.to_lowercase() } else { s };
+    let name = fold(name.to_string_lossy().into_owned());
+    let db_name = fold(db_name.to_string_lossy().into_owned());
+    ["", "-journal", "-wal", "-shm"]
+        .iter()
+        .any(|suffix| name == format!("{db_name}{suffix}"))
+}
+
 /// Whether two existing paths are the same file: through `..`, symlinks or, on Unix,
 /// hard links.
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -1919,10 +1982,6 @@ fn auto_vacuum_mode(conn: &Connection) -> Result<i64> {
 
 fn remaining_runs(max_runs: Option<i64>, scheduled_runs: i64) -> Option<i64> {
     max_runs.map(|max| (max - scheduled_runs).max(0))
-}
-
-fn jobs_has_column(conn: &Connection, column: &str) -> Result<bool> {
-    table_has_column(conn, "jobs", column)
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -2419,6 +2478,20 @@ mod tests {
             RunClaim::Claimed(_)
         ));
 
+        // The start time is read inside the claim, under the write lock.
+        let job_now = db.get_job_by_name("digest").expect("job");
+        let slot = job_now.next_run_at.expect("next");
+        let mut read = false;
+        let claim = db
+            .claim_scheduled_run_at(job.id, slot, slot, || {
+                read = true;
+                slot + mins(31)
+            })
+            .expect("claim");
+        assert!(read && matches!(claim, RunClaim::Missed(_, _)));
+        db.edit_job("digest", &JobEdit::default(), |_| unreachable!())
+            .expect("noop");
+
         // The next day the daemon is back two hours late: missed, and the job moves on.
         let tomorrow = when + mins(1440);
         let RunClaim::Missed(id, late) = db
@@ -2572,10 +2645,25 @@ mod tests {
             .unwrap()
             .join(".")
             .join(source.file_name().unwrap());
-        for alias in [source.clone(), dotted] {
+        let journal = std::path::PathBuf::from(format!("{}-journal", db.path));
+        let wal = std::path::PathBuf::from(format!("{}-wal", db.path));
+        for alias in [source.clone(), dotted, journal, wal] {
             let err = db.backup_to(&alias, true).expect_err("refused");
-            assert!(err.to_string().contains("database itself"), "{err}");
+            assert!(err.to_string().contains("the database or"), "{err}");
+            assert!(!alias.exists() || alias == source);
         }
+        // No partial copies are left beside the backup.
+        let dir = copy_path.parent().unwrap();
+        let stem = copy_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(!fs::read_dir(dir).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(&format!("{stem}.partial"))));
         assert_eq!(
             db.get_job_by_name("report")
                 .expect("still there")
