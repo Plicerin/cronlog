@@ -370,7 +370,13 @@ Cronlog also claims each scheduled run inside a SQLite write transaction. If two
 
 ## 11. Backup And Upgrade
 
-Back up the DB before upgrading:
+Back up the DB before upgrading. `cronlog backup` takes a consistent copy while the daemon runs:
+
+```bash
+cronlog --db /var/lib/cronlog/cronlog.db backup "/var/lib/cronlog/cronlog.db.$(date +%Y%m%d%H%M%S).bak"
+```
+
+A binary from before `cronlog backup` can't do that; stop the daemon and copy the file instead:
 
 ```bash
 systemctl stop cronlog

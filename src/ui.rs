@@ -52,7 +52,14 @@ pub fn print_jobs(jobs: &[JobListRow], color: bool) {
         table.add_row(vec![
             Cell::new(&job.name),
             enabled_cell(job.enabled, color),
-            Cell::new(&job.schedule),
+            Cell::new(match job.late_limit_seconds {
+                Some(limit) => format!(
+                    "{} (late limit {})",
+                    job.schedule,
+                    clock::format_seconds(limit)
+                ),
+                None => job.schedule.clone(),
+            }),
             Cell::new(
                 job.next_run_at
                     .map(clock::display)
@@ -91,7 +98,11 @@ pub fn print_history(rows: &[HistoryRow], color: bool) {
         table.add_row(vec![
             Cell::new(row.run_id),
             paint(
-                Cell::new(&row.status),
+                Cell::new(if row.skip_count > 1 {
+                    format!("{} x{}", row.status, row.skip_count)
+                } else {
+                    row.status.clone()
+                }),
                 color::for_status(&row.status),
                 color,
             ),

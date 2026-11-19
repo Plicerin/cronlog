@@ -144,8 +144,10 @@ pub fn check(db: &Database, now: NaiveDateTime, options: &HealthOptions) -> Resu
             );
         }
 
-        let timeout = Duration::seconds(job.timeout_seconds);
-        for (run_id, started_at) in db.running_runs(job.id)? {
+        for (run_id, started_at, run_timeout) in db.running_runs(job.id)? {
+            // The timeout this run was started with: `cronlog edit` may have changed the
+            // job's since, but the worker still uses the one it began with.
+            let timeout = Duration::seconds(run_timeout.unwrap_or(job.timeout_seconds));
             if let Some(started_at) = started_at {
                 if now - started_at > timeout + STUCK_AFTER_TIMEOUT {
                     problem(

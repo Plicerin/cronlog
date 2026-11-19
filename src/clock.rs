@@ -69,6 +69,11 @@ pub fn serialize_local<S: Serializer>(
     }
 }
 
+/// Whole seconds as a short duration: `45s`, `12m`, `3h 5m`, `2days 4h`.
+pub fn format_seconds(seconds: i64) -> String {
+    humantime::format_duration(std::time::Duration::from_secs(seconds.max(0) as u64)).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

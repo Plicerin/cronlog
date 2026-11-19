@@ -271,7 +271,7 @@ pub fn dispatch_due_jobs(
         let scheduled_for = job.next_run_at.unwrap_or(now);
         let next_run_at = next_run_after_scheduled_time(&job, scheduled_for, now)?;
 
-        match db.claim_scheduled_run(job.id, scheduled_for, next_run_at, clock::now())? {
+        match db.claim_scheduled_run_at(job.id, scheduled_for, next_run_at, clock::now)? {
             RunClaim::Claimed(run_id) => {
                 let db = db.clone();
                 let orphans = Arc::clone(orphans);
@@ -298,6 +298,14 @@ pub fn dispatch_due_jobs(
                 println!(
                     "Skipped '{}' because a previous run is still active",
                     job.name
+                );
+            }
+            RunClaim::Missed(_, late) => {
+                println!(
+                    "Missed '{}' slot at {}: {} late, past its late limit",
+                    job.name,
+                    clock::display(scheduled_for),
+                    clock::format_seconds(late.num_seconds())
                 );
             }
             RunClaim::NotDue => {}
@@ -438,7 +446,13 @@ fn execute_claimed_run(
         previous_status: previous.as_ref().map(|row| row.status.clone()),
     };
 
-    match runner::execute(job, &context) {
+    // Run with the timeout recorded on the run when it was claimed, which `health`
+    // checks it against, even if `cronlog edit` changed the job's in between.
+    let mut job = job.clone();
+    if let Some(timeout) = db.run_timeout(run_id)? {
+        job.timeout_seconds = timeout;
+    }
+    match runner::execute(&job, &context) {
         Ok(out) => {
             db.record_result(
                 run_id,
@@ -525,6 +539,7 @@ mod tests {
             timeout_seconds: 3600,
             max_runs: None,
             next_run_at: None,
+            late_limit_seconds: None,
         }
     }
 
