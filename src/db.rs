@@ -130,6 +130,9 @@ pub enum ManualClaim {
     Busy(i64, Option<NaiveDateTime>),
 }
 
+/// A running run: id, start time, and the timeout it was started with.
+pub type RunningRun = (i64, Option<NaiveDateTime>, Option<i64>);
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunClaim {
     Claimed(i64),
@@ -437,6 +440,10 @@ impl Database {
         if !jobs_has_column(&conn, "late_limit_seconds")? {
             conn.execute("ALTER TABLE jobs ADD COLUMN late_limit_seconds INTEGER", [])?;
         }
+        if !table_has_column(&conn, "runs", "timeout_seconds")? {
+            // The timeout a run was started with; NULL for runs from before this column.
+            conn.execute("ALTER TABLE runs ADD COLUMN timeout_seconds INTEGER", [])?;
+        }
         if !table_has_column(&conn, "runs", "skip_count")? {
             conn.execute(
                 "ALTER TABLE runs ADD COLUMN skip_count INTEGER NOT NULL DEFAULT 1",
@@ -640,15 +647,38 @@ impl Database {
     }
 
     /// Write a consistent copy of the whole database to `path` (SQLite's VACUUM INTO),
-    /// safe while the daemon is running. `path` must not exist.
-    pub fn backup_to(&self, path: &Path) -> Result<()> {
+    /// safe while the daemon is running. An existing file is an error unless `force`,
+    /// and is never the database itself. The copy is created like the pre-UTC backup:
+    /// owner-only on Unix, the database's access list on Windows, since it holds every
+    /// job's command and captured output.
+    pub fn backup_to(&self, path: &Path, force: bool) -> Result<()> {
         let target = path.to_str().ok_or_else(|| {
             CronlogError::InvalidCommand(format!(
                 "backup path is not valid UTF-8: {}",
                 path.display()
             ))
         })?;
-        self.conn()?.execute("VACUUM INTO ?1", params![target])?;
+        if path.exists() {
+            if same_file(path, Path::new(&self.path)) {
+                return Err(CronlogError::InvalidCommand(format!(
+                    "{} is the database itself; back it up to another file",
+                    path.display()
+                )));
+            }
+            if !force {
+                return Err(CronlogError::InvalidCommand(format!(
+                    "{} already exists; use --force to replace it",
+                    path.display()
+                )));
+            }
+            std::fs::remove_file(path)?;
+        }
+        // VACUUM INTO writes into an empty file it finds, keeping its permissions.
+        create_backup_file(target, &self.path)?;
+        if let Err(err) = self.conn()?.execute("VACUUM INTO ?1", params![target]) {
+            let _ = std::fs::remove_file(path);
+            return Err(err.into());
+        }
         Ok(())
     }
 
@@ -853,15 +883,31 @@ impl Database {
     }
 
     /// A job's `running` runs: (run id, started at).
-    pub fn running_runs(&self, job_id: i64) -> Result<Vec<(i64, Option<NaiveDateTime>)>> {
+    /// A job's running runs: id, start time, and the timeout each was started with
+    /// (`None` for a run from before runs recorded it).
+    pub fn running_runs(&self, job_id: i64) -> Result<Vec<RunningRun>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, started_at FROM runs WHERE job_id = ?1 AND status = 'running' ORDER BY id",
+            "SELECT id, started_at, timeout_seconds FROM runs
+             WHERE job_id = ?1 AND status = 'running' ORDER BY id",
         )?;
         let rows = stmt.query_map(params![job_id], |r| {
-            Ok((r.get(0)?, parse_dt_opt(r.get(1)?)))
+            Ok((r.get(0)?, parse_dt_opt(r.get(1)?), r.get(2)?))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The timeout a run was started with, if it recorded one.
+    pub fn run_timeout(&self, run_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT timeout_seconds FROM runs WHERE id = ?1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn get_job_by_name(&self, name: &str) -> Result<Job> {
@@ -983,8 +1029,9 @@ impl Database {
             }
         } else {
             tx.execute(
-                "INSERT INTO runs (job_id, status, scheduled_for, started_at, trigger_type)
-                 VALUES (?1, 'running', ?2, ?3, 'schedule')",
+                "INSERT INTO runs (job_id, status, scheduled_for, started_at, trigger_type, timeout_seconds)
+                 VALUES (?1, 'running', ?2, ?3, 'schedule',
+                         (SELECT timeout_seconds FROM jobs WHERE id = ?1))",
                 params![job_id, scheduled_for.to_string(), started_at.to_string()],
             )?;
             RunClaim::Claimed(tx.last_insert_rowid())
@@ -1025,8 +1072,9 @@ impl Database {
             }
         }
         tx.execute(
-            "INSERT INTO runs (job_id, status, scheduled_for, started_at, trigger_type)
-             VALUES (?1, 'running', ?2, ?3, 'manual')",
+            "INSERT INTO runs (job_id, status, scheduled_for, started_at, trigger_type, timeout_seconds)
+             VALUES (?1, 'running', ?2, ?3, 'manual',
+                     (SELECT timeout_seconds FROM jobs WHERE id = ?1))",
             params![job_id, scheduled_for.to_string(), started_at.to_string()],
         )?;
         let run_id = tx.last_insert_rowid();
@@ -1678,6 +1726,22 @@ fn prune_targets(conn: &Connection, keep_last: i64) -> Result<Vec<PruneTarget>> 
         }
     }
     Ok(targets)
+}
+
+/// Whether two existing paths are the same file: through `..`, symlinks or, on Unix,
+/// hard links.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Create `path`, empty and new, for a copy of the database at `db`.
@@ -2435,6 +2499,41 @@ mod tests {
     }
 
     #[test]
+    fn a_run_keeps_the_timeout_it_started_with() {
+        let db = test_db();
+        let when = fixed_time();
+        db.add_job(
+            "report",
+            &["echo".into()],
+            "every 10 minutes",
+            60,
+            None,
+            when,
+        )
+        .expect("add job");
+        let job = db.get_job_by_name("report").expect("job");
+        let RunClaim::Claimed(run) = db
+            .claim_scheduled_run(job.id, when, when + chrono::Duration::minutes(10), when)
+            .expect("claim")
+        else {
+            panic!("expected a run");
+        };
+        let change = JobEdit {
+            timeout_seconds: Some(5),
+            ..JobEdit::default()
+        };
+        db.edit_job("report", &change, |_| unreachable!())
+            .expect("edit");
+        assert_eq!(db.run_timeout(run).expect("timeout"), Some(60));
+        assert_eq!(
+            db.running_runs(job.id).expect("running"),
+            vec![(run, Some(when), Some(60))]
+        );
+        assert_eq!(db.get_job_by_name("report").unwrap().timeout_seconds, 5);
+        let _ = fs::remove_file(db.path);
+    }
+
+    #[test]
     fn backup_writes_a_readable_copy() {
         let db = test_db();
         let when = fixed_time();
@@ -2450,13 +2549,39 @@ mod tests {
         let copy_path = std::path::PathBuf::from(format!("{}.backup", db.path));
         let _ = fs::remove_file(&copy_path);
 
-        db.backup_to(&copy_path).expect("backup");
+        db.backup_to(&copy_path, false).expect("backup");
         let copy = Database::open(copy_path.to_str().unwrap()).expect("open copy");
         assert_eq!(
             copy.get_job_by_name("report").expect("job").timeout_seconds,
             60
         );
-        assert!(db.backup_to(&copy_path).is_err(), "won't overwrite");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&copy_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "owner-only");
+        }
+        assert!(db.backup_to(&copy_path, false).is_err(), "won't overwrite");
+        db.backup_to(&copy_path, true)
+            .expect("replaced with --force");
+
+        // Never the database itself, however it's named, even with --force.
+        let source = std::path::PathBuf::from(&db.path);
+        let dotted = source
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(source.file_name().unwrap());
+        for alias in [source.clone(), dotted] {
+            let err = db.backup_to(&alias, true).expect_err("refused");
+            assert!(err.to_string().contains("database itself"), "{err}");
+        }
+        assert_eq!(
+            db.get_job_by_name("report")
+                .expect("still there")
+                .timeout_seconds,
+            60
+        );
 
         let _ = fs::remove_file(&copy_path);
         let _ = fs::remove_file(db.path);

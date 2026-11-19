@@ -108,16 +108,7 @@ fn run(cli: Cli) -> Result<()> {
             println!("Updated job '{name}': {}{next}", changed.join(", "));
         }
         Commands::Backup { path, force } => {
-            if path.exists() {
-                if !force {
-                    return Err(error::CronlogError::InvalidCommand(format!(
-                        "{} already exists; use --force to replace it",
-                        path.display()
-                    )));
-                }
-                std::fs::remove_file(&path)?;
-            }
-            db.backup_to(&path)?;
+            db.backup_to(&path, force)?;
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             println!(
                 "Backed up {} to {} ({} KB)",

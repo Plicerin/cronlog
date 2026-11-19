@@ -446,7 +446,13 @@ fn execute_claimed_run(
         previous_status: previous.as_ref().map(|row| row.status.clone()),
     };
 
-    match runner::execute(job, &context) {
+    // Run with the timeout recorded on the run when it was claimed, which `health`
+    // checks it against, even if `cronlog edit` changed the job's in between.
+    let mut job = job.clone();
+    if let Some(timeout) = db.run_timeout(run_id)? {
+        job.timeout_seconds = timeout;
+    }
+    match runner::execute(&job, &context) {
         Ok(out) => {
             db.record_result(
                 run_id,
