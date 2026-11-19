@@ -690,17 +690,36 @@ impl Database {
         // Copy to a new file beside the target, then move it into place, so a copy that
         // fails (a busy database, a full disk) leaves any earlier backup as it was.
         // VACUUM INTO writes into an empty file it finds, keeping its permissions.
-        let partial = format!("{target}.partial-{}", std::process::id());
-        let _ = std::fs::remove_file(&partial); // left by an earlier crash of this pid
-        create_backup_file(&partial, &self.path)?;
+        let partial = self.reserve_partial(target)?;
         let copied = self
             .conn()
             .and_then(|conn| Ok(conn.execute("VACUUM INTO ?1", params![partial])?))
-            .and_then(|_| Ok(std::fs::rename(&partial, path)?));
+            .and_then(|_| publish_backup(Path::new(&partial), path, force));
         if copied.is_err() {
             let _ = std::fs::remove_file(&partial);
         }
-        copied.map(|_| ())
+        copied
+    }
+
+    /// Create an empty, owner-only file named `<target>.partial-<pid>-<n>` that no
+    /// other file has: an existing one (another backup's, or anything else) is left
+    /// alone and the next name tried.
+    fn reserve_partial(&self, target: &str) -> Result<String> {
+        let pid = std::process::id();
+        for n in 0..100 {
+            let partial = format!("{target}.partial-{pid}-{n}");
+            if is_database_file(Path::new(&partial), Path::new(&self.path)) {
+                continue;
+            }
+            match create_backup_file(&partial, &self.path) {
+                Ok(()) => return Ok(partial),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(CronlogError::InvalidCommand(format!(
+            "could not find a free temporary name beside {target}"
+        )))
     }
 
     pub fn list_jobs(&self) -> Result<Vec<JobListRow>> {
@@ -1038,7 +1057,7 @@ impl Database {
             let latest: Option<(i64, String, String, Option<String>)> = tx
                 .query_row(
                     "SELECT id, status, trigger_type, error FROM runs
-                     WHERE job_id = ?1 ORDER BY scheduled_for DESC, id DESC LIMIT 1",
+                     WHERE job_id = ?1 ORDER BY id DESC LIMIT 1",
                     params![job_id],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
@@ -1765,30 +1784,82 @@ fn prune_targets(conn: &Connection, keep_last: i64) -> Result<Vec<PruneTarget>> 
     Ok(targets)
 }
 
+/// Move a finished backup from `partial` to `path`. Without `force` an existing file
+/// at `path` is never replaced, even one another backup created a moment ago: the copy
+/// is published with a hard link, which fails if the name is taken.
+fn publish_backup(partial: &Path, path: &Path, force: bool) -> Result<()> {
+    if force {
+        std::fs::rename(partial, path)?;
+        return Ok(());
+    }
+    match std::fs::hard_link(partial, path) {
+        Ok(()) => {
+            std::fs::remove_file(partial)?;
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(CronlogError::InvalidCommand(format!(
+                "{} already exists; use --force to replace it",
+                path.display()
+            )))
+        }
+        // A file system without hard links (FAT, some network shares): check, then move.
+        Err(_) if !path.exists() => {
+            std::fs::rename(partial, path)?;
+            Ok(())
+        }
+        Err(_) => Err(CronlogError::InvalidCommand(format!(
+            "{} already exists; use --force to replace it",
+            path.display()
+        ))),
+    }
+}
+
 /// Whether `path` is the database at `db` or one of SQLite's files beside it
 /// (`-journal`, `-wal`, `-shm`), existing yet or not.
 fn is_database_file(path: &Path, db: &Path) -> bool {
     if path.exists() && same_file(path, db) {
         return true;
     }
+    // SQLite names its working files after the path it opened; check those of the
+    // file a symlink points to as well.
+    let real = std::fs::canonicalize(db).ok();
+    for db in std::iter::once(db).chain(real.as_deref()) {
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut name = db.as_os_str().to_owned();
+            name.push(suffix);
+            let working = Path::new(&name);
+            if path.exists() && working.exists() && same_file(path, working) {
+                return true;
+            }
+            if same_name(path, working) {
+                return true;
+            }
+        }
+    }
+    same_name(path, db) || real.as_deref().is_some_and(|real| same_name(path, real))
+}
+
+/// Whether two paths, existing or not, name the same entry in the same folder.
+fn same_name(path: &Path, other: &Path) -> bool {
     let dir = |p: &Path| {
         let parent = p.parent().filter(|d| !d.as_os_str().is_empty());
         std::fs::canonicalize(parent.unwrap_or(Path::new(".")))
     };
-    let (Ok(path_dir), Ok(db_dir), Some(name), Some(db_name)) =
-        (dir(path), dir(db), path.file_name(), db.file_name())
+    let (Ok(path_dir), Ok(other_dir), Some(name), Some(other_name)) =
+        (dir(path), dir(other), path.file_name(), other.file_name())
     else {
         return false;
     };
-    if path_dir != db_dir {
-        return false;
-    }
-    let fold = |s: String| if cfg!(windows) { s.to_lowercase() } else { s };
-    let name = fold(name.to_string_lossy().into_owned());
-    let db_name = fold(db_name.to_string_lossy().into_owned());
-    ["", "-journal", "-wal", "-shm"]
-        .iter()
-        .any(|suffix| name == format!("{db_name}{suffix}"))
+    let fold = |s: &std::ffi::OsStr| {
+        let s = s.to_string_lossy().into_owned();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    path_dir == other_dir && fold(name) == fold(other_name)
 }
 
 /// Whether two existing paths are the same file: through `..`, symlinks or, on Unix,
@@ -2607,6 +2678,26 @@ mod tests {
     }
 
     #[test]
+    fn working_files_are_found_through_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("cronlog-wf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.db");
+        fs::write(&real, b"").unwrap();
+        assert!(is_database_file(&dir.join("real.db-wal"), &real));
+        assert!(is_database_file(&dir.join("./real.db-journal"), &real));
+        assert!(!is_database_file(&dir.join("real.db.bak"), &real));
+        #[cfg(unix)]
+        {
+            let alias = dir.join("alias.db");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            assert!(is_database_file(&dir.join("real.db-journal"), &alias));
+            assert!(is_database_file(&dir.join("alias.db-journal"), &alias));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn backup_writes_a_readable_copy() {
         let db = test_db();
         let when = fixed_time();
@@ -2652,6 +2743,23 @@ mod tests {
             assert!(err.to_string().contains("the database or"), "{err}");
             assert!(!alias.exists() || alias == source);
         }
+        // Without --force a backup never replaces a file, even one that appears while
+        // the copy runs; a stray file at a temporary name is left alone.
+        let stray = format!("{}.partial-{}-0", copy_path.display(), std::process::id());
+        fs::write(&stray, b"not ours").unwrap();
+        let fresh = copy_path.with_extension("fresh.db");
+        db.backup_to(&fresh, false)
+            .expect("backup beside a stray file");
+        assert_eq!(fs::read(&stray).unwrap(), b"not ours");
+        fs::remove_file(&stray).unwrap();
+        let err = publish_backup(&copy_path, &fresh, false).expect_err("taken");
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(
+            copy_path.exists(),
+            "the copy stays when it can't be published"
+        );
+        fs::remove_file(&fresh).unwrap();
+
         // No partial copies are left beside the backup.
         let dir = copy_path.parent().unwrap();
         let stem = copy_path
