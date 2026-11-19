@@ -472,6 +472,15 @@ impl Database {
                     tx.execute(ddl, [])?;
                 }
             }
+            // Runs still going from before runs recorded their timeout get the job's
+            // current one now, so a later `cronlog edit` can't change what they're
+            // checked against.
+            tx.execute(
+                "UPDATE runs SET timeout_seconds =
+                     (SELECT timeout_seconds FROM jobs WHERE jobs.id = runs.job_id)
+                 WHERE status = 'running' AND timeout_seconds IS NULL",
+                [],
+            )?;
             tx.commit()?;
         }
         self.convert_times_to_utc(&mut conn, &Local)?;
@@ -694,7 +703,7 @@ impl Database {
         let copied = self
             .conn()
             .and_then(|conn| Ok(conn.execute("VACUUM INTO ?1", params![partial])?))
-            .and_then(|_| publish_backup(Path::new(&partial), path, force));
+            .and_then(|_| publish_backup(Path::new(&partial), path, force, &self.path));
         if copied.is_err() {
             let _ = std::fs::remove_file(&partial);
         }
@@ -1786,33 +1795,44 @@ fn prune_targets(conn: &Connection, keep_last: i64) -> Result<Vec<PruneTarget>> 
 
 /// Move a finished backup from `partial` to `path`. Without `force` an existing file
 /// at `path` is never replaced, even one another backup created a moment ago: the copy
-/// is published with a hard link, which fails if the name is taken.
-fn publish_backup(partial: &Path, path: &Path, force: bool) -> Result<()> {
+/// is published with a hard link, which fails if the name is taken, or, where the file
+/// system has no hard links (FAT, some network shares), copied into a file created
+/// only if the name is free. `db` gives that file its permissions.
+fn publish_backup(partial: &Path, path: &Path, force: bool, db: &str) -> Result<()> {
+    let taken = || {
+        CronlogError::InvalidCommand(format!(
+            "{} already exists; use --force to replace it",
+            path.display()
+        ))
+    };
     if force {
         std::fs::rename(partial, path)?;
         return Ok(());
     }
     match std::fs::hard_link(partial, path) {
-        Ok(()) => {
-            std::fs::remove_file(partial)?;
-            Ok(())
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Err(taken()),
+        Err(_) => {
+            let target = path.to_str().ok_or_else(taken)?;
+            match create_backup_file(target, db) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Err(taken()),
+                Err(err) => return Err(err.into()),
+            }
+            let copied = (|| {
+                let mut from = std::fs::File::open(partial)?;
+                let mut to = std::fs::OpenOptions::new().write(true).open(path)?;
+                std::io::copy(&mut from, &mut to)?;
+                to.sync_all()
+            })();
+            if let Err(err) = copied {
+                let _ = std::fs::remove_file(path); // the file this call created
+                return Err(err.into());
+            }
         }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(CronlogError::InvalidCommand(format!(
-                "{} already exists; use --force to replace it",
-                path.display()
-            )))
-        }
-        // A file system without hard links (FAT, some network shares): check, then move.
-        Err(_) if !path.exists() => {
-            std::fs::rename(partial, path)?;
-            Ok(())
-        }
-        Err(_) => Err(CronlogError::InvalidCommand(format!(
-            "{} already exists; use --force to replace it",
-            path.display()
-        ))),
     }
+    std::fs::remove_file(partial)?;
+    Ok(())
 }
 
 /// Whether `path` is the database at `db` or one of SQLite's files beside it
@@ -2674,6 +2694,18 @@ mod tests {
             vec![(run, Some(when), Some(60))]
         );
         assert_eq!(db.get_job_by_name("report").unwrap().timeout_seconds, 5);
+
+        // A run from before runs recorded their timeout gets its job's on the next open.
+        db.conn()
+            .unwrap()
+            .execute(
+                "UPDATE runs SET timeout_seconds = NULL WHERE id = ?1",
+                params![run],
+            )
+            .unwrap();
+        let reopened = Database::open(&db.path).expect("reopen");
+        reopened.init().expect("init");
+        assert_eq!(reopened.run_timeout(run).expect("timeout"), Some(5));
         let _ = fs::remove_file(db.path);
     }
 
@@ -2752,7 +2784,7 @@ mod tests {
             .expect("backup beside a stray file");
         assert_eq!(fs::read(&stray).unwrap(), b"not ours");
         fs::remove_file(&stray).unwrap();
-        let err = publish_backup(&copy_path, &fresh, false).expect_err("taken");
+        let err = publish_backup(&copy_path, &fresh, false, &db.path).expect_err("taken");
         assert!(err.to_string().contains("already exists"), "{err}");
         assert!(
             copy_path.exists(),
